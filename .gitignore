@@ -1,5 +1,6 @@
 extracted_images/
 extracted_text/
+extracted_figures/
 dxa_data.xlsx
 data/
 pat_*.txt   
@@ -7,6 +8,7 @@ test_*.txt
 test_*.tif  
 test_psm*.txt
 test_psm*.tif
+
 
 # Python & Environment
 venv/

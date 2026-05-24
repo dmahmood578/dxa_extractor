@@ -65,6 +65,21 @@ python dxa_to_excel.py
 - Accounts for common OCR artifacts and GE Lunar / Hologic layout variations.
 - Outputs the finalized data table to `dxa_data.xlsx` with T-score-based color coding (e.g. yellow for osteopenia, red for osteoporosis).
 
+### 3.1 Parse Data to Wide CSV (Research Export)
+```bash
+python dxa_to_wide_csv.py
+```
+**What it does:**
+- Parses the OCR'd text files to extract and merge into a single wide per-patient row:
+  - Patient Demographics (Name, DOB, Age, Height, Weight, Sex, Scan Date, Referring MD)
+  - AP Spine L1-L4 aggregate and per-vertebra L1–L4 (BMD, T-score, Z-score)
+  - Left & Right Femur — Neck and Total (BMD, T-score, Z-score)
+  - TBS (Trabecular Bone Score)
+  - Raw section text and row counts for AP Spine, Left/Right Femur, DualFemur, TBS, and Trend sections
+- Merges OCR-derived fields with DICOM demographics from `data/patient_cohort_demographics.csv` where available.
+- Accounts for common OCR artifacts and GE Lunar / Hologic layout variations, including merged %YA+T-score tokens and missing decimal points in older firmware exports.
+- Outputs to `data/patient_wide_measurements.csv` — one row per patient, suitable for direct import into statistical tools (R, SPSS, REDCap, etc.).
+
 ### 4. Extract DICOM Demographics (Optional)
 ```bash
 python list_all_patients.py
