@@ -58,9 +58,12 @@ The master runner (`scripts/run_full_pipeline.py`) handles all backends and stag
 # Everything except Surya (fastest recommended path):
 python scripts/run_full_pipeline.py --step all --skip-surya
 
+# Paddle with 4 CPU workers (omit --workers for single-process, default):
+python scripts/run_full_pipeline.py --step paddle --workers 4
+
 # Individual stages:
 python scripts/run_full_pipeline.py --step tesseract     # default OCR + wide CSV
-python scripts/run_full_pipeline.py --step paddle        # Paddle OCR + full parse
+python scripts/run_full_pipeline.py --step paddle        # Paddle OCR + full parse (single-process)
 python scripts/run_full_pipeline.py --step compare       # per-patient backend comparisons
 python scripts/run_full_pipeline.py --step validate      # agreement report → flags gaps
 python scripts/run_full_pipeline.py --step surya --patient 3   # Surya fallback (slow)

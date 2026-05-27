@@ -74,15 +74,28 @@ def step_tesseract(args: argparse.Namespace) -> int:
 
 
 def step_paddle(args: argparse.Namespace) -> int:
-    """Run Paddle OCR (batch), reorganize, and full parse."""
-    print("\n\033[1m=== PADDLE OCR (BATCH) ===\033[0m")
-    paddle_cmd = [
-        _VENV_PYTHON, "scripts/run_paddle_batch.py",
-        "--input", "extracted_images",
-        "--outdir", "ocr_compare",
-        "--ext", "png",
-        "--skip-existing",
-    ]
+    """Run Paddle OCR (batch or parallel), reorganize, and full parse."""
+    workers = getattr(args, 'workers', 1) or 1
+
+    if workers > 1:
+        print(f"\n\033[1m=== PADDLE OCR (PARALLEL — {workers} workers) ===\033[0m")
+        paddle_cmd = [
+            _VENV_PYTHON, "scripts/run_paddle_parallel.py",
+            "--input", "extracted_images",
+            "--outdir", "ocr_compare",
+            "--workers", str(workers),
+            "--ext", "png",
+            "--skip-existing",
+        ]
+    else:
+        print("\n\033[1m=== PADDLE OCR (BATCH — single-process) ===\033[0m")
+        paddle_cmd = [
+            _VENV_PYTHON, "scripts/run_paddle_batch.py",
+            "--input", "extracted_images",
+            "--outdir", "ocr_compare",
+            "--ext", "png",
+            "--skip-existing",
+        ]
     rc = run(paddle_cmd, dry=args.dry_run)
     if rc != 0:
         print("  Paddle OCR failed — stopping.")
@@ -294,7 +307,8 @@ def main() -> int:
     parser.add_argument("--step", required=True,
                         choices=["tesseract", "paddle", "surya", "compare", "validate", "all"])
     parser.add_argument("--patient", default=None, help="Limit to patient folder N")
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=1,
+                        help="CPU workers for Paddle step (1 = single-process batch; >1 = parallel)")
     parser.add_argument("--skip-tesseract", action="store_true")
     parser.add_argument("--skip-paddle", action="store_true")
     parser.add_argument("--skip-surya", action="store_true")
