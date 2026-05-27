@@ -6,89 +6,176 @@ This repository contains scripts to automatically extract demographics and bone 
 
 ## Prerequisites
 
-1. **Python 3.x**
-2. **Tesseract OCR**: Required to read the text off the DXA report images.
-   - The scripts use the `tesseract` command from your system PATH. Make sure it is installed and available in your terminal.
-3. **Python Environment Setup**: 
-   It's highly recommended to use a virtual environment to manage dependencies:
-   ```bash
-   # Create a virtual environment
-   python -m venv venv
-   
-   # Activate it (Mac/Linux)
-   source venv/bin/activate
-   # Or on Windows:
-   # venv\Scripts\activate
+### System dependencies (install once per machine)
 
-   # Install the required libraries
-   pip install -r requirements.txt
-   ```
+**Tesseract OCR** — not a Python package; must be installed at the OS level.
+
+| OS | Command |
+|----|---------|
+| macOS (Homebrew) | `brew install tesseract` |
+| Windows | Download installer from [UB-Mannheim/tesseract](https://github.com/UB-Mannheim/tesseract/wiki). Ensure `tesseract.exe` is on your PATH (typically `C:\Program Files\Tesseract-OCR\`). |
+| Linux (apt) | `sudo apt install tesseract-ocr` |
+
+Verify installation:
+```bash
+tesseract --version
+```
+
+**llama.cpp** (only needed for the optional Surya LLM backend):
+
+| OS | Command |
+|----|---------|
+| macOS (Homebrew) | `brew install llama.cpp` |
+| Windows / Linux | See [llama.cpp releases](https://github.com/ggerganov/llama.cpp/releases) — download a prebuilt binary or build from source. |
+
+### Python environment (created once per project)
+
+- **Python 3.9+** (recommended: 3.11)
+
+  ```bash
+  python3.11 -m venv .venv
+  source .venv/bin/activate      # macOS / Linux
+  # .venv\Scripts\activate       # Windows
+  pip install -r requirements.txt
+  ```
 
 ## Core Workflow
 
-To process a new batch of DXA scans, follow these steps:
+### Quick Start (Tesseract only)
 
-### 1. Data Placement
-Ensure your raw DICOM folders are placed in a directory named `CLD DXA` adjacent to or containing the patient folders. The folder structure is expected to look like:
+```bash
+cd dxa_extractor
+source .venv/bin/activate
+python extract_all_data.py          # extract images + OCR
+python dxa_to_wide_csv.py           # parse → data/patient_wide_measurements.csv
+```
+
+### Unified Master Runner
+
+The master runner (`scripts/run_full_pipeline.py`) handles all backends and stages:
+
+```bash
+# Everything except Surya (fastest recommended path):
+python scripts/run_full_pipeline.py --step all --skip-surya
+
+# Individual stages:
+python scripts/run_full_pipeline.py --step tesseract     # default OCR + wide CSV
+python scripts/run_full_pipeline.py --step paddle        # Paddle OCR + full parse
+python scripts/run_full_pipeline.py --step compare       # per-patient backend comparisons
+python scripts/run_full_pipeline.py --step validate      # agreement report → flags gaps
+python scripts/run_full_pipeline.py --step surya --patient 3   # Surya fallback (slow)
+
+# Stage scoped to one patient:
+python scripts/run_full_pipeline.py --step compare --patient 3
+
+# Preview commands without running:
+python scripts/run_full_pipeline.py --step all --dry-run
+```
+
+**Output files produced:**
+
+| File | Source | Contents |
+|------|--------|----------|
+| `data/patient_wide_measurements.csv` | Tesseract | Demographics + all BMD/T/Z regions + per-vertebra + TBS |
+| `data/paddle_wide_measurements.csv` | Paddle | Same schema, independent extraction |
+| `data/validation_report.md` | Validate step | Patient-by-patient Tesseract vs Paddle agreement; Surya recommendations |
+| `ocr_compare/patient_N/compare_summary.md` | Compare step | Per-patient 3-way comparison (Tesseract/Paddle/Surya) |
+
+### Step-by-step (manual control)
+
+<details><summary>Click to expand — individual scripts</summary>
+
+#### 1. Data Placement
+Raw DICOM folders go in `CLD DXA/` adjacent to the repo root:
+
 ```text
 CLD DXA/
-  ├── 1/
-  │   └── DICOM/ ...
+  ├── 1/  (DICOM/)
   ├── 2/
   ...
 dxa_extractor/
   ├── extract_all_data.py
-  ├── dxa_to_excel.py
   ...
 ```
 
-### 2. Extract Images & Run OCR
+#### 2. Extract images + Tesseract OCR
 ```bash
-cd dxa_extractor
 python extract_all_data.py
 ```
-**What it does:**
-- Scans all patient DICOM folders in `CLD DXA/`.
-- Extracts the embedded DXA report pages as PNG images into `extracted_images/`.
-- Runs Tesseract OCR on the images and saves the raw text output to `extracted_text/`.
+→ `extracted_images/Patient_N/` and `extracted_text/Patient_N/`
 
-### 3. Parse Data to Excel (Main Extraction)
-```bash
-python dxa_to_excel.py
-```
-**What it does:**
-- Parses the OCR'd text files to extract:
-  - Patient Demographics (Name, DOB, Age, Height, Weight, Sex, Scan Date, Referring MD)
-  - AP Spine L1-L4 (BMD, T-score, Z-score)
-  - Left & Right Femur - Neck and Total (BMD, T-score, Z-score)
-  - TBS (Trabecular Bone Score)
-- Accounts for common OCR artifacts and GE Lunar / Hologic layout variations.
-- Outputs the finalized data table to `dxa_data.xlsx` with T-score-based color coding (e.g. yellow for osteopenia, red for osteoporosis).
-
-### 3.1 Parse Data to Wide CSV (Research Export)
+#### 3. Parse to wide CSV
 ```bash
 python dxa_to_wide_csv.py
 ```
-**What it does:**
-- Parses the OCR'd text files to extract and merge into a single wide per-patient row:
-  - Patient Demographics (Name, DOB, Age, Height, Weight, Sex, Scan Date, Referring MD)
-  - AP Spine L1-L4 aggregate and per-vertebra L1–L4 (BMD, T-score, Z-score)
-  - Left & Right Femur — Neck and Total (BMD, T-score, Z-score)
-  - TBS (Trabecular Bone Score)
-  - Raw section text and row counts for AP Spine, Left/Right Femur, DualFemur, TBS, and Trend sections
-- Merges OCR-derived fields with DICOM demographics from `data/patient_cohort_demographics.csv` where available.
-- Accounts for common OCR artifacts and GE Lunar / Hologic layout variations, including merged %YA+T-score tokens and missing decimal points in older firmware exports.
-- Outputs to `data/patient_wide_measurements.csv` — one row per patient, suitable for direct import into statistical tools (R, SPSS, REDCap, etc.).
+→ `data/patient_wide_measurements.csv` (demographics + all BMD/T/Z regions)
 
-### 4. Extract DICOM Demographics (Optional)
+#### 4. DICOM demographics (optional)
 ```bash
 python list_all_patients.py
 ```
-**What it does:**
-- Bypasses OCR and reads patient metadata directly from the DICOM headers.
-- Saves `patient_cohort_demographics.csv` into the `data/` folder.
+→ `data/patient_cohort_demographics.csv`
 
-## Troubleshooting & Debugging Scripts
+#### 5. Excel output (optional)
+```bash
+python dxa_to_excel.py
+```
+→ `dxa_data.xlsx` with T-score color coding.
+
+</details>
+
+## 5. Multi-Backend OCR (Paddle, Surya)
+
+The project supports PaddleOCR and Surya as alternative OCR backends. The unified master runner handles all stages — see **Core Workflow** above. Full details in **[scripts/README_OCR_SETUP.md](scripts/README_OCR_SETUP.md)**.
+
+### Quick install (optional backends)
+
+```bash
+source .venv/bin/activate
+pip install paddlepaddle paddleocr            # PaddleOCR
+pip install surya-ocr opencv-python           # Surya
+brew install llama.cpp                        # Surya dependency (macOS)
+```
+
+### Master runner commands
+
+```bash
+python scripts/run_full_pipeline.py --step paddle              # Paddle OCR + full parse
+python scripts/run_full_pipeline.py --step validate            # Agreement report
+python scripts/run_full_pipeline.py --step surya --patient 3   # Surya fallback on patient 3
+python scripts/run_full_pipeline.py --step all --skip-surya    # Everything except Surya
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `SpawnError` / missing `llama-server` | `brew install llama.cpp` |
+| Paddle `PPStructure` init error | Use `run_paddle_batch.py` or `run_paddle_parallel.py` instead |
+| `libpng error: IDAT: CRC error` | Re-run `extract_all_data.py` for that patient |
+| Merge finds no matching row | Use `--folder <n>` instead of `--name` |
+| Runs are slow | Check `ps aux \| egrep 'paddle\|llama\|surya'`; verify model cache at `~/.paddlex/` |
+| Abort Surya/llama | `pkill -f llama-server` |
+| Pipeline step fails silently | Run with `--dry-run` to preview commands, then execute individually |
+
+### Backend comparison
+
+| Backend | Speed per image | Best for |
+|---------|----------------|----------|
+| Tesseract | ~1 s | Default first pass |
+| Paddle (batch) | ~2–10 s | Validation, noisy fonts |
+| Paddle (parallel) | ~(2–10)/N s | Large batches (50+ images, 4+ cores) |
+| Surya (LLM) | ~2–5 min | Failure recovery only |
+
+### Heuristics tuning (quick reference)
+
+| Backend | Files to edit | Key parameters |
+|---------|--------------|----------------|
+| Tesseract | `dxa_to_wide_csv.py` | `_OCR_SIGN_MAP`, PSM mode, `_REGION_LABELS_RE` (loose mode) |
+| Paddle | `scripts/paddle_line_extract.py` | `num_re` regex, context window, BMD sanity range (0.1–3.0) |
+| Surya | `scripts/merge_surya_to_csv.py` | Header detection keywords, column index mapping |
+
+## 6. Troubleshooting & Debugging Scripts
 
 This directory includes several auxiliary scripts for debugging extraction issues:
 
@@ -97,5 +184,8 @@ This directory includes several auxiliary scripts for debugging extraction issue
 - **`inspect_dxa_file.py` / `dicom_inspect.py` / `sr_dump.py`**: Dumps raw DICOM headers and Structured Report (SR) tags to the console to see what raw text/data is natively available before OCR.
 - **`test_hologic_ocr.py`**: Tests different Tesseract Page Segmentation Modes (PSM) for difficult Hologic scans.
 
-## Note on OCR Artifacts
-The parser in `dxa_to_excel.py` has a built-in mapping (`_OCR_SIGN_MAP`) to handle common Tesseract misreads (e.g., converting `O4` to `-0.4`, or `24` to `-2.4`). If new scans consistently fail to parse certain numbers, check the raw text in `extracted_text/` and update the map or regex inside `dxa_to_excel.py` as needed.
+## 7. OCR Artifacts & Parser Notes
+
+The parsers in `dxa_to_wide_csv.py` and `dxa_to_excel.py` share a built-in mapping (`_OCR_SIGN_MAP`) to handle common Tesseract misreads (e.g., converting `O4` to `-0.4`, or `24` to `-2.4`). If new scans consistently fail to parse certain numbers, check the raw text in `extracted_text/` and update the map or regex inside `dxa_to_wide_csv.py` as needed.
+
+The wide-CSV parser (`dxa_to_wide_csv.py`) now supports any OCR backend (Tesseract, Paddle, Surya) via an automatic loose-section fallback (`find_ancillary_section_loose`). When the tight, multi-column Tesseract-style row detection finds too few rows, the parser re-groups clean OCR text by region labels (L1–L4, Neck, Total, etc.) and re-attempts extraction. Use `--text-source <dir>` to point the parser at any OCR output directory.

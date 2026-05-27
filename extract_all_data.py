@@ -1,13 +1,15 @@
 import os
 import re
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pydicom
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 
 TESSERACT_PATH = "tesseract"
+TESSERACT_NUMERIC_WHITELIST = "0123456789.,-+()%[]/:|"
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
@@ -98,11 +100,58 @@ def crop_region(img, box):
     ))
 
 
-def run_tesseract(image_path, txt_output_path_base, psm=None):
-    cmd = [TESSERACT_PATH, image_path, txt_output_path_base]
-    if psm is not None:
-        cmd.extend(["--psm", str(psm), "-c", "preserve_interword_spaces=1"])
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+def _prepare_ocr_image(img, numeric=False):
+    prepared = ImageOps.grayscale(img)
+    prepared = ImageOps.autocontrast(prepared)
+    prepared = prepared.filter(ImageFilter.SHARPEN)
+
+    if min(prepared.size) < 1400:
+        scale = max(2, int(round(1400 / max(1, min(prepared.size)))))
+        prepared = prepared.resize(
+            (prepared.size[0] * scale, prepared.size[1] * scale),
+            Image.Resampling.LANCZOS,
+        )
+
+    if numeric:
+        prepared = prepared.filter(ImageFilter.MedianFilter(size=3))
+        prepared = prepared.point(lambda px: 255 if px > 185 else 0)
+
+    return prepared
+
+
+def _tesseract_text_from_image(img, psm=6, numeric=False):
+    config = ["--oem", "1", "--psm", str(psm), "-c", "preserve_interword_spaces=1"]
+    if numeric:
+        config.extend(["-c", f"tessedit_char_whitelist={TESSERACT_NUMERIC_WHITELIST}"])
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        _prepare_ocr_image(img, numeric=numeric).save(tmp_path)
+        cmd = [TESSERACT_PATH, tmp_path, "stdout", *config]
+        cp = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return (cp.stdout or "").strip()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def run_tesseract(image_path, txt_output_path_base, psm=None, numeric=False):
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception:
+        return None
+
+    text = _tesseract_text_from_image(img, psm=psm or (11 if numeric else 6), numeric=numeric)
+    txt_path = f"{txt_output_path_base}.txt"
+    with open(txt_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        if text and not text.endswith("\n"):
+            handle.write("\n")
+    return txt_path
 
 
 def save_region_ocr(image_path, patient_txt_dir, base_name, region_def):
@@ -118,7 +167,7 @@ def save_region_ocr(image_path, patient_txt_dir, base_name, region_def):
     region_img_path = os.path.join(patient_txt_dir, f"{region_base}.png")
     region_txt_base = os.path.join(patient_txt_dir, region_base)
     region_img.save(region_img_path)
-    run_tesseract(region_img_path, region_txt_base, psm=region_def.get("psm", 6))
+    run_tesseract(region_img_path, region_txt_base, psm=region_def.get("psm", 6), numeric=True)
     return region_txt_base + ".txt"
 
 
@@ -236,6 +285,9 @@ def process_patient_folder(folder):
             if figure_path:
                 figure_count += 1
                 print(f"  Saved figure crop: {figure_path}")
+                figure_txt_base = os.path.splitext(figure_path)[0]
+                run_tesseract(figure_path, figure_txt_base, psm=6, numeric=False)
+                run_tesseract(figure_path, f"{figure_txt_base}.numeric", psm=11, numeric=True)
         except Exception as exc:
             print(f"  OCR failed for {img_path}: {exc}")
 

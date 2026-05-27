@@ -1,6 +1,8 @@
 extracted_images/
 extracted_text/
 extracted_figures/
+paddle_text/
+ocr_*/
 dxa_data.xlsx
 data/
 pat_*.txt   
@@ -11,8 +13,8 @@ test_psm*.tif
 
 
 # Python & Environment
-venv/
-.venv/
+venv*/
+.venv*/
 __pycache__/
 *.pyc
 .DS_Store

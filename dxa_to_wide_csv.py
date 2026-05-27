@@ -20,7 +20,8 @@ import pandas as pd
 # ── paths ────────────────────────────────────────────────────────────────────
 
 _SCRIPT_DIR = Path(__file__).parent
-TEXT_DIR     = _SCRIPT_DIR / "extracted_text"
+DEFAULT_TEXT_DIR = _SCRIPT_DIR / "extracted_text"
+TEXT_DIR = DEFAULT_TEXT_DIR
 DATA_DIR     = _SCRIPT_DIR / "data"
 DEMOGRAPHICS_CSV = DATA_DIR / "patient_cohort_demographics.csv"
 OUTPUT_CSV       = DATA_DIR / "patient_wide_measurements.csv"
@@ -154,6 +155,12 @@ SECTIONS: dict[str, tuple[list[str], list[str], list[str]]] = {
 
 _SECTION_STOP_KEYWORDS = frozenset(["statistical", "comments", "tbs", "trend", "frax", "page:", "hologic", "lunar", "©"])
 _NAME_STOPS = ["Referring", "Facility", "Birth", "Date", "Patient", "ID", "Phone", "Height"]
+
+# Region labels that indicate a new data row in loose (Paddle/Surya) mode
+_REGION_LABELS_RE = re.compile(
+    r'\b(l[1-5]|neck|total|ward|troch|inter|shaft|tbs|mean|diff)\b',
+    re.IGNORECASE,
+)
 
 _SIDE_ALIASES: dict[str, list[str]] = {
     "left":  ["left", "lett", "let", "lef", "lefe"],
@@ -297,9 +304,78 @@ def find_ancillary_section(txt: str, keyword: str) -> list[str]:
     return data_rows
 
 
+def find_ancillary_section_loose(txt: str, keyword: str) -> list[str]:
+    """
+    Same as find_ancillary_section() but works with clean (Paddle/Surya) text
+    where numbers are on separate lines rather than in multi-column rows.
+
+    Strategy: find section, collect all lines, then group consecutive lines
+    into pseudo-rows. A new pseudo-row starts when a line contains a region
+    label (L1–L5, Neck, Total, Ward, Troch, etc.).
+    """
+    kw_lower = keyword.lower()
+    txt_lower = txt.lower()
+
+    start = next(
+        (m.start() for m in _RE_ANCILLARY.finditer(txt_lower)
+         if kw_lower in txt_lower[m.start(): m.start() + 80]),
+        -1,
+    )
+    if start == -1:
+        return []
+
+    lines = txt[start: start + 4000].split("\n")
+
+    # Collect all lines until a stop keyword
+    raw_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(stop in stripped.lower() for stop in _SECTION_STOP_KEYWORDS):
+            break
+        raw_lines.append(stripped)
+        if len(raw_lines) >= 200:
+            break
+
+    if not raw_lines:
+        return []
+
+    # Group into pseudo-rows keyed by region labels
+    pseudo_rows: list[str] = []
+    current_row: list[str] = []
+
+    for line in raw_lines:
+        low = line.lower()
+        is_region = bool(_REGION_LABELS_RE.search(low))
+
+        if is_region and current_row:
+            # Start a new pseudo-row; flush the previous one
+            pseudo_rows.append(" ".join(current_row))
+            current_row = [line]
+        else:
+            current_row.append(line)
+
+    if current_row:
+        pseudo_rows.append(" ".join(current_row))
+
+    # Filter to rows that contain at least one digit
+    return [r for r in pseudo_rows if _digit_count(r) >= 1]
+
+
+def _find_section_rows(txt: str, keyword: str) -> list[str]:
+    """Try tight (Tesseract) parsing first; fall back to loose if too few rows."""
+    rows = find_ancillary_section(txt, keyword)
+    if len(rows) < 4:
+        loose = find_ancillary_section_loose(txt, keyword)
+        if len(loose) > len(rows):
+            return loose
+    return rows
+
+
 def ge_spine_l1l4(texts: dict[str, str]) -> BmdResult:
     for txt in texts.values():
-        rows = find_ancillary_section(txt, "ap spine")
+        rows = _find_section_rows(txt, "ap spine")
         if len(rows) >= 7:
             result = extract_bmd_row(rows[6])
             if result.is_valid():
@@ -324,7 +400,7 @@ def ge_spine_vertebrae(texts: dict[str, str]) -> dict[str, Optional[float]]:
     out: dict[str, Optional[float]] = dict.fromkeys(keys, None)
 
     for txt in texts.values():
-        rows = find_ancillary_section(txt, "ap spine")
+        rows = _find_section_rows(txt, "ap spine")
         if not rows:
             continue
         for line in rows:
@@ -370,7 +446,7 @@ def ge_femur(texts: dict[str, str], side: str) -> FemurResult:
 
     for kw in search_keywords:
         for txt in texts.values():
-            rows = find_ancillary_section(txt, kw)
+            rows = _find_section_rows(txt, kw)
             if not rows:
                 continue
             for row in rows:
@@ -395,6 +471,68 @@ def ge_femur(texts: dict[str, str], side: str) -> FemurResult:
             break
 
     return result
+
+
+def ge_hologic_fallback(texts: dict[str, str]) -> tuple[BmdResult, FemurResult, FemurResult]:
+    """
+    Heuristic extractor for Hologic-formatted reports.
+    Looks for lines containing 'Neck' or 'Total' with a sequence of numeric tokens
+    (Area, BMC, BMD, T-score, ...) and maps the third numeric to BMD and the
+    fourth to T-score when available.
+    Returns (spine_bmdresult, left_femur_result, right_femur_result).
+    """
+    comb = combined(texts)
+
+    def _tok_nums(s: str) -> list[str]:
+        parts = re.findall(r"[0-9]+\.[0-9]+|[0-9]{3,4}", s)
+        return parts
+
+    spine = BmdResult()
+    left = FemurResult()
+    right = FemurResult()
+
+    # Search for lines mentioning Hip/Neck/Total that contain 3+ numeric tokens
+    for line in comb.splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if any(k in low for k in ("neck", "total", "hip", "l1", "l4", "spine")):
+            nums = _tok_nums(ln)
+            if len(nums) >= 3:
+                # third number is likely BMD (or a 4-digit old-format token)
+                bmd_tok = nums[2]
+                try:
+                    bmd_val = _fix_bmd_token(bmd_tok) if re.match(r"^[01]\d{3}$", bmd_tok) else float(bmd_tok)
+                except Exception:
+                    continue
+                if not (BMD_MIN < bmd_val < BMD_MAX):
+                    continue
+
+                # attempt T-score from next numeric token if present
+                t_val = None
+                if len(nums) >= 4:
+                    t_tok = nums[3]
+                    t_val = parse_score_token(t_tok)
+
+                if "spine" in low or re.search(r"l\s*1|l1|l4|l\s*4", low) or "ap spine" in low:
+                    if spine.bmd is None:
+                        spine = BmdResult(bmd=bmd_val, t=t_val)
+                elif ("left" in low and "femur" in low) or re.search(r"left\s+hip|left femur", low):
+                    # set neck or total based on presence of 'neck'/'total'
+                    r = BmdResult(bmd=bmd_val, t=t_val)
+                    if "neck" in low:
+                        left.neck = r
+                    else:
+                        left.total = r
+                elif ("right" in low and "femur" in low) or re.search(r"right\s+hip|right femur", low):
+                    r = BmdResult(bmd=bmd_val, t=t_val)
+                    if "neck" in low:
+                        right.neck = r
+                    else:
+                        right.total = r
+
+    return spine, left, right
 
 
 # ── demographics parsers ──────────────────────────────────────────────────────
@@ -609,16 +747,14 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
 
     is_hologic = "hologic" in comb.lower()
     if is_hologic:
-        # Hologic reports have non-standard layouts; preserve output shape but
-        # leave numeric fields null pending a dedicated parser.
-        null_fields = (
-            "Spine_L1L4_BMD Spine_L1L4_T Spine_L1L4_Z "
-            "LFemur_Neck_BMD LFemur_Neck_T LFemur_Neck_Z "
-            "LFemur_Total_BMD LFemur_Total_T LFemur_Total_Z "
-            "RFemur_Neck_BMD RFemur_Neck_T RFemur_Neck_Z "
-            "RFemur_Total_BMD RFemur_Total_T RFemur_Total_Z"
-        ).split()
-        rec.update(dict.fromkeys(null_fields, None))
+        # Try a Hologic-specific heuristic extractor; fall back to empty fields
+        # if the heuristic finds nothing usable.
+        spine, left_femur, right_femur = ge_hologic_fallback(texts)
+        vertebrae = ge_spine_vertebrae(texts)
+        rec.update(spine.to_dict("Spine_L1L4"))
+        rec.update(vertebrae)
+        rec.update(left_femur.to_dict("LFemur"))
+        rec.update(right_femur.to_dict("RFemur"))
     else:
         spine      = ge_spine_l1l4(texts)
         vertebrae  = ge_spine_vertebrae(texts)
@@ -662,6 +798,25 @@ _PREFERRED_COLUMNS = [
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    import sys
+
+    # Parse optional CLI flags
+    text_source = DEFAULT_TEXT_DIR
+    output_csv = OUTPUT_CSV
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == '--text-source' and i + 1 < len(sys.argv):
+            text_source = Path(sys.argv[i + 1])
+            i += 2
+        elif sys.argv[i] == '--output' and i + 1 < len(sys.argv):
+            output_csv = Path(sys.argv[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    global TEXT_DIR
+    TEXT_DIR = Path(text_source)
+
     demographics_df = (
         pd.read_csv(DEMOGRAPHICS_CSV) if DEMOGRAPHICS_CSV.exists() else pd.DataFrame()
     )
@@ -706,8 +861,8 @@ def main() -> None:
         df[score_cols] = df[score_cols].round(1)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\nSaved: {OUTPUT_CSV}")
+    df.to_csv(output_csv, index=False)
+    print(f"\nSaved: {output_csv}")
     print(df.head().to_string(index=False))
 
 
