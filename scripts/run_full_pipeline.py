@@ -32,10 +32,9 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _SCRIPT_DIR.parent
 
-if sys.platform == "win32":
-    _VENV_PYTHON = str(_PROJECT_DIR / ".venv" / "Scripts" / "python.exe")
-else:
-    _VENV_PYTHON = str(_PROJECT_DIR / ".venv" / "bin" / "python")
+# Use the same Python interpreter that is running this script.
+# When the venv is activated, sys.executable already points to the venv Python.
+_VENV_PYTHON = sys.executable
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
