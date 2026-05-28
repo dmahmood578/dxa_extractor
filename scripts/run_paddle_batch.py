@@ -5,7 +5,14 @@ Writes per-image TXT and JSON like `scripts/paddle_line_extract.py`.
 
 Usage: python scripts/run_paddle_batch.py --input extracted_images --outdir ocr_compare --ext png --skip-existing
 """
-import argparse, os, json, re, sys
+import os
+
+# Disable Paddle oneDNN and PIR backends — fixes Windows compatibility issues
+# (ConvertPirAttribute2RuntimeAttribute / oneDNN instruction errors)
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("FLAGS_enable_pir_api", "0")
+
+import argparse, json, re, sys
 from pathlib import Path
 
 parser = argparse.ArgumentParser()

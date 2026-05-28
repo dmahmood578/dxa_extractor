@@ -5,7 +5,14 @@ Each worker initializes PaddleOCR once and processes a partition of images.
 
 Usage: python scripts/run_paddle_parallel.py --input extracted_images --outdir ocr_compare --workers 4 --skip-existing
 """
-import argparse, os, json, re, sys, multiprocessing, traceback
+import os
+
+# Disable Paddle oneDNN and PIR backends — fixes Windows compatibility issues
+# (ConvertPirAttribute2RuntimeAttribute / oneDNN instruction errors)
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("FLAGS_enable_pir_api", "0")
+
+import argparse, json, re, sys, multiprocessing, traceback
 from pathlib import Path
 
 def process_partition(worker_id, img_paths, outdir, skip_existing):
