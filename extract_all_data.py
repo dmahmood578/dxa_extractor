@@ -130,7 +130,7 @@ def _tesseract_text_from_image(img, psm=6, numeric=False):
     try:
         _prepare_ocr_image(img, numeric=numeric).save(tmp_path)
         cmd = [TESSERACT_PATH, tmp_path, "stdout", *config]
-        cp = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
         return (cp.stdout or "").strip()
     finally:
         try:
