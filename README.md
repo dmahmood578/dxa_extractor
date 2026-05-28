@@ -134,10 +134,13 @@ The project supports PaddleOCR and Surya as alternative OCR backends. The unifie
 ### Quick install (optional backends)
 
 ```bash
-source .venv/bin/activate
-pip install paddlepaddle paddleocr            # PaddleOCR
-pip install surya-ocr opencv-python           # Surya
-brew install llama.cpp                        # Surya dependency (macOS)
+# Activate the venv FIRST — otherwise pip installs system-wide:
+source .venv/bin/activate          # macOS / Linux
+# .venv\Scripts\activate           # Windows
+
+pip install paddlepaddle==2.6.2 paddleocr==2.7.3   # PaddleOCR (pin both — 3.x PaddleOCR requires Paddle 3.x which has Windows bugs)
+pip install surya-ocr opencv-python         # Surya (macOS/Linux only)
+brew install llama.cpp                      # Surya dependency (macOS)
 ```
 
 ### Master runner commands
@@ -155,6 +158,8 @@ python scripts/run_full_pipeline.py --step all --skip-surya    # Everything exce
 |---------|-----|
 | `SpawnError` / missing `llama-server` | `brew install llama.cpp` |
 | Paddle `PPStructure` init error | Use `run_paddle_batch.py` or `run_paddle_parallel.py` instead |
+| Paddle `ConvertPirAttribute…` / `onednn_instruction.cc` (Windows) | PaddlePaddle 3.x oneDNN bug on Windows. Use `paddlepaddle==2.6.2 paddleocr==2.7.3` |
+| Paddle `set_optimization_level` error | PaddleOCR 3.x + PaddlePaddle 2.x mismatch. Use `paddlepaddle==2.6.2 paddleocr==2.7.3` |
 | `libpng error: IDAT: CRC error` | Re-run `extract_all_data.py` for that patient |
 | Merge finds no matching row | Use `--folder <n>` instead of `--name` |
 | Runs are slow | Check `ps aux \| egrep 'paddle\|llama\|surya'`; verify model cache at `~/.paddlex/` |

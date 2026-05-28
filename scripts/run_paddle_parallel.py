@@ -72,13 +72,28 @@ def process_partition(worker_id, img_paths, outdir, skip_existing):
                     recs = page.get('rec_texts') or []
                     lines.extend([t for t in recs if isinstance(t, str)])
             else:
+                # PaddleOCR 2.x format: list of pages, each page is a list of
+                # [bbox, (text, score)] or [bbox, (text, score)] detections.
                 for item in res:
-                    if isinstance(item, (list, tuple)) and len(item) >= 2:
-                        candidate = item[1]
-                        if isinstance(candidate, (list, tuple)) and len(candidate) > 0 and isinstance(candidate[0], str):
-                            lines.append(candidate[0])
-                        elif isinstance(candidate, str):
-                            lines.append(candidate)
+                    if isinstance(item, (list, tuple)) and len(item) > 0:
+                        # item could be a page (list of detections) or a single detection
+                        # Heuristic: if item[0] is a list of lists (bbox), item is a page
+                        if isinstance(item[0], (list, tuple)) and len(item[0]) > 0 and isinstance(item[0][0], (list, tuple)):
+                            # item is a page — iterate over detections
+                            for detection in item:
+                                if isinstance(detection, (list, tuple)) and len(detection) >= 2:
+                                    candidate = detection[1]
+                                    if isinstance(candidate, (list, tuple)) and len(candidate) > 0:
+                                        lines.append(str(candidate[0]))
+                                    elif isinstance(candidate, str):
+                                        lines.append(candidate)
+                        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                            # item is a single detection
+                            candidate = item[1]
+                            if isinstance(candidate, (list, tuple)) and len(candidate) > 0:
+                                lines.append(str(candidate[0]))
+                            elif isinstance(candidate, str):
+                                lines.append(candidate)
                     elif isinstance(item, str):
                         lines.append(item)
 
