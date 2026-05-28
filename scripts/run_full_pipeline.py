@@ -44,7 +44,14 @@ def run(cmd: list[str], dry: bool = False, cwd: str | None = None) -> int:
     print(f"\n  \033[36m{cmd_str}\033[0m", flush=True)
     if dry:
         return 0
-    result = subprocess.run(cmd, cwd=cwd or str(_PROJECT_DIR))
+    # Ensure Paddle oneDNN / PIR flags are in the child process's actual OS
+    # environment from birth — Paddle's C++ layer reads them before Python's
+    # os.environ modifications take effect inside the script.
+    env = os.environ.copy()
+    env.setdefault("FLAGS_use_mkldnn", "0")
+    env.setdefault("FLAGS_enable_pir_api", "0")
+    env.setdefault("KMP_AFFINITY", "disabled")
+    result = subprocess.run(cmd, cwd=cwd or str(_PROJECT_DIR), env=env)
     return result.returncode
 
 
