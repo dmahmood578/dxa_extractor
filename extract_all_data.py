@@ -213,10 +213,78 @@ def save_figure_crop(image_path, figure_dir, metadata, ocr_text=""):
     return out_path
 
 
+def detect_manufacturer(folder_path: str) -> str:
+    """Read the Manufacturer tag from the first readable DICOM in folder_path.
+    Returns 'GE' or 'HOLOGIC' or 'UNKNOWN'.
+    Falls back to OCR-based detection if DICOM tags are unavailable.
+    """
+    for root, _, files in os.walk(folder_path):
+        for filename in files:
+            if filename.startswith(".") or filename.upper() == "DICOMDIR":
+                continue
+            try:
+                ds = pydicom.dcmread(os.path.join(root, filename), stop_before_pixels=True)
+                mfr = str(getattr(ds, "Manufacturer", "")).upper()
+                if "GE" in mfr:
+                    return "GE"
+                if "HOLOGIC" in mfr or "HOLOGIC" in mfr:
+                    return "HOLOGIC"
+                model = str(getattr(ds, "ManufacturerModelName", "")).upper()
+                if "HOLOGIC" in model or "DISCOVERY" in model or "HORIZON" in model:
+                    return "HOLOGIC"
+                if "LUNAR" in model or "PRODIGY" in model or "IDXA" in model:
+                    return "GE"
+                return "UNKNOWN"
+            except Exception:
+                pass
+    return "UNKNOWN"
+
+
+def detect_manufacturer_from_text(ocr_text: str) -> str:
+    """Fallback: detect manufacturer from OCR text content.
+    GE scans mention 'GE Healthcare' or 'Lunar'; Hologic mentions 'HOLOGIC'."""
+    low = ocr_text.lower()
+    if "hologic" in low:
+        return "HOLOGIC"
+    if "ge healthcare" in low or "lunar prodigy" in low or "lunar idxa" in low:
+        return "GE"
+    return "UNKNOWN"
+
+
+# ── GE table-only vs figure image classifier ─────────────────────────────────
+
+# OCR markers that indicate a table-only (ancillary results) image for GE Lunar.
+_TABLE_ONLY_MARKERS_RE = re.compile(
+    r"ancillary\s+results", re.IGNORECASE
+)
+
+# OCR markers that indicate a figure/plot image (NOT a clean table) for GE.
+_FIGURE_MARKERS_RE = re.compile(
+    r"(?:tbs\s+mapping|frax\s+\*|reference\s+graph|"
+    r"bone\s+density\s+trend|tbs\s+trend|"
+    r"probability\s+of\s+fracture)",
+    re.IGNORECASE,
+)
+
+
+def is_table_only_ge(ocr_text: str) -> bool:
+    """Return True if the OCR text looks like a GE table-only (ancillary) image
+    rather than a figure/plot image.  Table-only images contain the ancillary
+    results header and do NOT contain figure captions."""
+    if not ocr_text or len(ocr_text.strip()) < 100:
+        return False
+    has_ancillary = bool(_TABLE_ONLY_MARKERS_RE.search(ocr_text))
+    has_figure = bool(_FIGURE_MARKERS_RE.search(ocr_text))
+    # A table-only page has ancillary results AND no figure marker.
+    return has_ancillary and not has_figure
+
+
 def process_patient_folder(folder):
     folder_path = os.path.join(CLD_DXA_DIR, folder)
     if not os.path.isdir(folder_path):
         return
+
+    manufacturer = detect_manufacturer(folder_path)
 
     anonymized_id = f"ANON_{folder}"
     for root, _, files in os.walk(folder_path):
@@ -232,7 +300,7 @@ def process_patient_folder(folder):
         if anonymized_id:
             break
 
-    print(f"\nProcessing Folder {folder} (ID: {anonymized_id})...")
+    print(f"\nProcessing Folder {folder} (ID: {anonymized_id}) [Manufacturer: {manufacturer}]...")
 
     patient_img_dir = os.path.join(EXTRACTED_IMAGES_DIR, f"Patient_{folder}")
     patient_txt_dir = os.path.join(EXTRACTED_TEXT_DIR, f"Patient_{folder}")
@@ -294,6 +362,52 @@ def process_patient_folder(folder):
     print(f"  Completed OCR on {ocr_count} images for Folder {folder}.")
     print(f"  Saved {region_count} region OCR files for Folder {folder}.")
     print(f"  Saved {figure_count} figure crops for Folder {folder}.")
+
+    # ── Post-OCR: classify GE images as table-only vs figure ──────────────
+    table_only_bases: list[str] = []
+    # If DICOM-based manufacturer detection failed, try OCR text fallback
+    if manufacturer == "UNKNOWN":
+        for fname in sorted(os.listdir(patient_txt_dir)):
+            if not fname.endswith(".txt") or fname.startswith("_"):
+                continue
+            base = os.path.splitext(fname)[0]
+            if any(base.endswith(f"_{r['name']}") for r in REGION_DEFS):
+                continue
+            try:
+                with open(os.path.join(patient_txt_dir, fname), encoding="utf-8", errors="replace") as fh:
+                    manufacturer = detect_manufacturer_from_text(fh.read())
+                if manufacturer != "UNKNOWN":
+                    break
+            except Exception:
+                pass
+    if manufacturer == "GE":
+        for fname in sorted(os.listdir(patient_txt_dir)):
+            if not fname.endswith(".txt"):
+                continue
+            # Only classify the full-page OCR files (not region/header crops)
+            base = os.path.splitext(fname)[0]
+            if any(base.endswith(f"_{r['name']}") for r in REGION_DEFS):
+                continue
+            fpath = os.path.join(patient_txt_dir, fname)
+            try:
+                with open(fpath, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+                if is_table_only_ge(text):
+                    table_only_bases.append(base)
+            except Exception:
+                pass
+        if table_only_bases:
+            list_path = os.path.join(patient_txt_dir, "_table_only.txt")
+            with open(list_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(table_only_bases) + "\n")
+            print(f"  GE: {len(table_only_bases)}/{ocr_count} images classified as table-only → _table_only.txt")
+        else:
+            print(f"  GE: No table-only images found — parser will use all images.")
+
+    # Write manufacturer hint for the parser
+    mfr_path = os.path.join(patient_txt_dir, "_manufacturer.txt")
+    with open(mfr_path, "w", encoding="utf-8") as fh:
+        fh.write(manufacturer + "\n")
 
 
 def main():

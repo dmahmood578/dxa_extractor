@@ -79,10 +79,52 @@ python scripts/run_full_pipeline.py --step all --dry-run
 
 | File | Source | Contents |
 |------|--------|----------|
-| `data/patient_wide_measurements.csv` | Tesseract | Demographics + all BMD/T/Z regions + per-vertebra + TBS |
+| `data/patient_wide_measurements.csv` | Tesseract | Demographics (name, DOB, age, sex, ethnicity, height, weight, physician, scan date) + Spine L1‑L4 & per‑vertebra L1‑L4 (BMD, YA%, T, AM%, Z, BMC, Area) + Femur Neck/Total (same 7 fields) + TBS |
 | `data/paddle_wide_measurements.csv` | Paddle | Same schema, independent extraction |
-| `data/validation_report.md` | Validate step | Patient-by-patient Tesseract vs Paddle agreement; Surya recommendations |
-| `ocr_compare/patient_N/compare_summary.md` | Compare step | Per-patient 3-way comparison (Tesseract/Paddle/Surya) |
+| `data/validation_report.md` | Validate step | Patient‑by‑patient Tesseract vs Paddle agreement; Surya recommendations |
+| `ocr_compare/patient_N/compare_summary.md` | Compare step | Per‑patient 3‑way comparison (Tesseract/Paddle/Surya) |
+
+### Pipeline architecture
+
+```mermaid
+flowchart TB
+    subgraph INPUT["📁 Input"]
+        DICOM["CLD DXA/{1..N}/*.dcm<br/>Raw DICOM files"]
+    end
+
+    subgraph TESS["🔤 Tesseract OCR (step 1)"]
+        EXTRACT["extract_all_data.py<br/>• Extract PNG images → extracted_images/<br/>• Run Tesseract OCR → extracted_text/<br/>• Detect manufacturer (GE / HOLOGIC)<br/>• Classify GE images: table-only vs figure<br/>• Save metadata files per patient"]
+    end
+
+    subgraph PARSE_T["📊 Tesseract → CSV"]
+        CSV_T["dxa_to_wide_csv.py<br/>• Read extracted_text/Patient_N/<br/>• GE: filter to table-only images<br/>• HOLOGIC: use all images<br/>• Extract BMD/T/Z + demographics<br/>→ data/patient_wide_measurements.csv"]
+    end
+
+    subgraph PADDLE["🔍 Paddle OCR (step 2)"]
+        PAD_OCR["run_paddle_batch.py (or parallel)<br/>• Read extracted_images/<br/>• Run PaddleOCR<br/>→ ocr_compare/patient_N/paddle/"]
+        PAD_REORG["paddle_to_parser_layout.py<br/>• Reorganize output<br/>→ paddle_text/Patient_N/"]
+        PAD_META["Copy metadata<br/>extracted_text/ → paddle_text/<br/>(_table_only.txt, _manufacturer.txt)"]
+    end
+
+    subgraph PARSE_P["📊 Paddle → CSV"]
+        CSV_P["dxa_to_wide_csv.py<br/>--text-source paddle_text<br/>• Same GE/Hologic filtering<br/>→ data/paddle_wide_measurements.csv"]
+    end
+
+    subgraph VALIDATE["✅ Validation (step 3)"]
+        COMPARE["Per-patient comparison<br/>Tesseract vs Paddle<br/>→ ocr_compare/patient_N/"]
+        REPORT["Agreement report<br/>→ data/validation_report.md<br/>Flags gaps, Surya recommendations"]
+    end
+
+    DICOM --> EXTRACT
+    EXTRACT --> CSV_T
+    EXTRACT --> PAD_OCR
+    CSV_T --> COMPARE
+    PAD_OCR --> PAD_REORG
+    PAD_REORG --> PAD_META
+    PAD_META --> CSV_P
+    CSV_P --> COMPARE
+    COMPARE --> REPORT
+```
 
 ### Step-by-step (manual control)
 
@@ -111,7 +153,9 @@ python extract_all_data.py
 ```bash
 python dxa_to_wide_csv.py
 ```
-→ `data/patient_wide_measurements.csv` (demographics + all BMD/T/Z regions)
+→ `data/patient_wide_measurements.csv` — full ancillary table extraction:
+demographics + Spine L1‑L4 & per‑vertebra (BMD, YA%, T‑score, AM%, Z‑score, BMC, Area)
++ Left/Right Femur Neck & Total (same fields) + TBS + ethnicity.
 
 #### 4. DICOM demographics (optional)
 ```bash
@@ -152,6 +196,23 @@ python scripts/run_full_pipeline.py --step surya --patient 3   # Surya fallback 
 python scripts/run_full_pipeline.py --step all --skip-surya    # Everything except Surya
 ```
 
+### GE vs Hologic — automatic image filtering
+
+The extractor detects the DXA scanner manufacturer from DICOM tags (or OCR text as fallback) and applies different strategies:
+
+| Manufacturer | Strategy |
+|-------------|----------|
+| **GE Lunar** | Table-only images are identified by the `ANCILLARY RESULTS:` header and used for measurement extraction. Figure/plot images (graphs, TBS mapping, FRAX) are automatically skipped — their noisy OCR would otherwise pull wrong numbers from chart axes and captions. |
+| **Hologic** | All images are used. Hologic scans embed data tables inside the figure images, so no filtering is applied. |
+
+**How it works:**
+
+1. `extract_all_data.py` classifies each GE image as *table-only* or *figure* based on OCR content and writes `_table_only.txt` + `_manufacturer.txt` per patient.
+2. `dxa_to_wide_csv.py` reads these metadata files and only parses table-only images for GE patients.
+3. For the Paddle backend, metadata is automatically copied from the Tesseract output so filtering applies identically.
+
+**No user action required** — the filtering is fully automatic. If you switch between backends, re-run `--step tesseract` first (or use `--step all`) so the metadata files are up to date.
+
 ### Troubleshooting
 
 | Symptom | Fix |
@@ -160,6 +221,8 @@ python scripts/run_full_pipeline.py --step all --skip-surya    # Everything exce
 | Paddle `PPStructure` init error | Use `run_paddle_batch.py` or `run_paddle_parallel.py` instead |
 | Paddle `ConvertPirAttribute…` / `onednn_instruction.cc` (Windows) | PaddlePaddle 3.x oneDNN bug on Windows. Use `paddlepaddle==2.6.2 paddleocr==2.7.3` |
 | Paddle `set_optimization_level` error | PaddleOCR 3.x + PaddlePaddle 2.x mismatch. Use `paddlepaddle==2.6.2 paddleocr==2.7.3` |
+| `FileNotFoundError` from `run_full_pipeline.py` (Windows) | Ensure the venv is activated before running the pipeline. The runner uses `sys.executable` — it needs the venv Python. |
+| T‑scores show positive values (should be negative) | Re‑run with latest code. The parser now corrects OCR sign loss for T‑scores and preserves Z‑score signs. |
 | `libpng error: IDAT: CRC error` | Re-run `extract_all_data.py` for that patient |
 | Merge finds no matching row | Use `--folder <n>` instead of `--name` |
 | Runs are slow | Check `ps aux \| egrep 'paddle\|llama\|surya'`; verify model cache at `~/.paddlex/` |
@@ -179,7 +242,8 @@ python scripts/run_full_pipeline.py --step all --skip-surya    # Everything exce
 
 | Backend | Files to edit | Key parameters |
 |---------|--------------|----------------|
-| Tesseract | `dxa_to_wide_csv.py` | `_OCR_SIGN_MAP`, PSM mode, `_REGION_LABELS_RE` (loose mode) |
+| Tesseract | `dxa_to_wide_csv.py` | `_OCR_SIGN_MAP` (OCR→float corrections), `parse_score_token` (sign handling), `_REGION_LABELS_RE` (loose mode) |
+| Tesseract | `extract_all_data.py` | `_TABLE_ONLY_MARKERS_RE` / `_FIGURE_MARKERS_RE` (GE table‑vs‑figure classifier) |
 | Paddle | `scripts/paddle_line_extract.py` | `num_re` regex, context window, BMD sanity range (0.1–3.0) |
 | Surya | `scripts/merge_surya_to_csv.py` | Header detection keywords, column index mapping |
 

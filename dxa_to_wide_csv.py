@@ -78,6 +78,7 @@ _RE_SCAN_DATE   = re.compile(r"(?:measured|scan\s*date)\s*:\s*([0-9A-Za-z/,\s:.-
 _RE_DATE_MDY    = re.compile(r"(\d{1,2}/\d{1,2}/(?:20|19)\d{2})")
 _RE_PHYSICIAN   = re.compile(r"referring\s*physician\s*:\s*([A-Za-z\s.,'\-]{4,80})", re.IGNORECASE)
 _RE_TBS         = re.compile(r"tbs\s*l1[-–]l4\s*:\s*([0-9.]+)", re.IGNORECASE)
+_RE_ETHNICITY   = re.compile(r"ethnicity\s*:\s*([A-Za-z]+)", re.IGNORECASE)
 _RE_BMD_NEW     = re.compile(r"^[01]\.\d{2,3}")
 _RE_BMD_OLD     = re.compile(r"^[01]\d{3}$")
 _RE_MERGED_YA_T = re.compile(r"^(\d{2,3})(-\d{1,3})$")
@@ -89,15 +90,27 @@ _RE_WHITESPACE  = re.compile(r"\s+")
 
 @dataclass
 class BmdResult:
-    bmd: Optional[float] = None
-    t:   Optional[float] = None
-    z:   Optional[float] = None
+    bmd:    Optional[float] = None
+    ya_pct: Optional[float] = None   # Young Adult %
+    t:      Optional[float] = None   # T‑score
+    am_pct: Optional[float] = None   # Age Matched %
+    z:      Optional[float] = None   # Z‑score
+    bmc:    Optional[float] = None   # Bone Mineral Content (g)
+    area:   Optional[float] = None   # Area (cm²)
 
     def is_valid(self) -> bool:
         return self.bmd is not None and BMD_MIN < self.bmd < BMD_MAX
 
     def to_dict(self, prefix: str) -> dict[str, Optional[float]]:
-        return {f"{prefix}_BMD": self.bmd, f"{prefix}_T": self.t, f"{prefix}_Z": self.z}
+        return {
+            f"{prefix}_BMD":    self.bmd,
+            f"{prefix}_YA":     self.ya_pct,
+            f"{prefix}_T":      self.t,
+            f"{prefix}_AM":     self.am_pct,
+            f"{prefix}_Z":      self.z,
+            f"{prefix}_BMC":    self.bmc,
+            f"{prefix}_Area":   self.area,
+        }
 
 
 @dataclass
@@ -169,12 +182,32 @@ _SIDE_ALIASES: dict[str, list[str]] = {
 
 # ── text helpers ──────────────────────────────────────────────────────────────
 
-def read_folder(patient_dir: Path) -> dict[str, str]:
-    """Return {filename: text} for every *.txt in a patient folder."""
-    return {
-        p.name: p.read_text(encoding="utf-8", errors="replace")
-        for p in sorted(patient_dir.glob("*.txt"))
-    }
+def read_folder(patient_dir: Path, table_only_bases: set[str] | None = None) -> dict[str, str]:
+    """Return {filename: text} for every *.txt in a patient folder.
+
+    If *table_only_bases* is provided (GE scans), only files whose stem
+    appears in that set are included — figure/plot images are skipped so
+    their noisy OCR does not pollute the measurement extraction.
+    Metadata files (_table_only.txt, _manufacturer.txt) are always excluded.
+    """
+    result: dict[str, str] = {}
+    for p in sorted(patient_dir.glob("*.txt")):
+        if p.name.startswith("_"):
+            continue
+        if table_only_bases is not None:
+            stem = p.stem
+            # Region crop files have suffixes like _ap_spine, _header, etc.
+            # We want to keep them only if their parent full-page image is table-only.
+            parent_base = stem
+            for suffix in ["_ap_spine", "_header", "_left_femur", "_dual_femur",
+                           "_tbs", "_trend"]:
+                if stem.endswith(suffix):
+                    parent_base = stem[: -len(suffix)]
+                    break
+            if parent_base not in table_only_bases:
+                continue
+        result[p.name] = p.read_text(encoding="utf-8", errors="replace")
+    return result
 
 
 def combined(texts: dict[str, str]) -> str:
@@ -187,24 +220,98 @@ def _digit_count(s: str) -> int:
 
 # ── OCR score parser ──────────────────────────────────────────────────────────
 
-def parse_score_token(tok: str) -> Optional[float]:
-    """Convert an OCR token to a float score, or None if unreadable."""
+def parse_score_token(tok: str, expect_negative: bool = False) -> Optional[float]:
+    """Convert an OCR token to a float score, or None if unreadable.
+
+    Parameters
+    ----------
+    tok : str
+        The raw OCR token (e.g. "12", "-1.2", "O4", "a3").
+    expect_negative : bool
+        If True (T‑scores), a 2‑3 digit all‑numeric token like "12" is
+        interpreted as −1.2 (OCR lost the minus sign and decimal point).
+        If False (Z‑scores), the sign from OCR is preserved — "15" → +1.5,
+        "-15" → −1.5.
+    """
     tok = tok.strip("[]|\"'()")
     if not tok or tok in ("N/A", "-", "=", "*", ">", "<"):
         return None
+
+    # Check the OCR→float correction map first
     if tok in _OCR_SIGN_MAP:
         return _OCR_SIGN_MAP[tok]
+
+    # Handle explicit negative sign
+    has_explicit_minus = tok.startswith("-")
     cleaned = re.sub(r"[^0-9.\-]", "", tok)
     if not cleaned or cleaned == ".":
         return None
     try:
         val = float(cleaned)
-        # Two- or three-digit integers encode tenths: "12" → −1.2
-        if tok.isdigit() and 2 <= len(tok) <= 3:
-            val = -abs(val / 10.0)
-        return val
     except ValueError:
         return None
+
+    # Two‑ or three‑digit all‑numeric token with no decimal point:
+    # e.g. OCR read "−1.2" as "12" (lost minus + dot), or "1.5" as "15".
+    if tok.isdigit() and 2 <= len(tok) <= 3:
+        if expect_negative:
+            # T‑scores in this population are essentially always negative
+            val = -abs(val / 10.0)
+        else:
+            # Z‑scores / other: preserve the sign from OCR; "15" → +1.5
+            val = val / 10.0
+
+    # When a T‑score token has a decimal point but lost its minus sign
+    # (e.g. OCR read "−3.2" as "3.2"), force it negative.  This only
+    # applies when *expect_negative* is True AND there is no explicit
+    # minus sign anywhere in the token.
+    if expect_negative and not has_explicit_minus and not tok.startswith("-"):
+        # Don't flip if the token was in the OCR_SIGN_MAP (already corrected)
+        if tok not in _OCR_SIGN_MAP:
+            val = -abs(val)
+
+    # 4↔1 OCR confusion correction for Tesseract: "4" ↔ "1" misreads
+    # in score tokens.  Only apply when the token looks like a plausible
+    # score that is off by a digit substitution.
+    # Restrict to T‑scores (expect_negative=True) — Z‑scores and other
+    # values are less likely to suffer this specific confusion.
+    if expect_negative and not has_explicit_minus and not tok.isdigit():
+        corrected = _correct_digit_confusions(tok)
+        if corrected is not None:
+            return corrected
+
+    return val
+
+
+def _correct_digit_confusions(tok: str) -> Optional[float]:
+    """Detect and correct common Tesseract digit misreads in score tokens.
+
+    Tesseract frequently confuses '4' ↔ '1' and '4' ↔ '9' in certain
+    DXA report fonts.  This function checks a few high‑confidence
+    substitution patterns and returns the corrected float, or None if
+    no correction looks safe.
+    """
+    # Pattern: a 3‑char token like "3.4" where the last digit might be
+    # a misread "1" → should be "3.1" (a more plausible T‑score)
+    m = re.match(r"^(-?\d)\.([149])(\d?)$", tok)
+    if m:
+        base = float(m.group(1))
+        tenths_digit = m.group(2)
+        hundredths = m.group(3)
+        sign = -1 if tok.startswith("-") else 1
+
+        # "X.4" → likely "X.1" (4 → 1 confusion, very common)
+        if tenths_digit == "4":
+            candidate = sign * (abs(base) + 0.1 + (int(hundredths) / 100 if hundredths else 0))
+            if SCORE_MIN <= candidate <= SCORE_MAX:
+                return candidate
+        # "X.1" → sometimes "X.4" (1 → 4 confusion)
+        if tenths_digit == "1":
+            candidate = sign * (abs(base) + 0.4 + (int(hundredths) / 100 if hundredths else 0))
+            if SCORE_MIN <= candidate <= SCORE_MAX:
+                return candidate
+
+    return None
 
 
 def _fix_bmd_token(tok: str) -> float:
@@ -228,8 +335,13 @@ def _split_merged_ya_t(tok: str) -> tuple[Optional[int], Optional[float]]:
 
 def extract_bmd_row(row_str: str) -> BmdResult:
     """
-    Parse a GE Lunar table row: label BMD %YA T-score %AM Z-score …
-    Handles new format (0.873) and old format (0873 or merged 86-10).
+    Parse a GE Lunar ancillary table row.  Full column layout:
+
+        Region  BMD(g/cm²)  YA(%)  T‑score  AM(%)  Z‑score  BMC(g)  Area(cm²)
+        ------- ----------- ------ -------- ------ -------- ------- ----------
+
+    Handles new format (0.873), old format (0873), and merged YA+T tokens
+    (e.g. "86-10" → YA=86%, T=−1.0).
     """
     tokens = row_str.split()
     bmd_idx = next(
@@ -249,21 +361,60 @@ def extract_bmd_row(row_str: str) -> BmdResult:
         idx = bmd_idx + offset
         return tokens[idx] if idx < len(tokens) else None
 
-    t = z = None
-    ya_tok = _tok(1)
-    if ya_tok:
-        merged_ya, merged_t = _split_merged_ya_t(ya_tok)
-        if merged_ya is not None:
-            t = merged_t
-            z = parse_score_token(_tok(3)) if _tok(3) else None
-        else:
-            t = parse_score_token(_tok(2)) if _tok(2) else None
-            z = parse_score_token(_tok(4)) if _tok(4) else None
+    def _parse_pct(tok: Optional[str]) -> Optional[float]:
+        """Parse a percentage token (YA% or AM%).  Always positive."""
+        if not tok:
+            return None
+        tok = tok.strip("[]|\"'(),")
+        try:
+            val = float(tok)
+            return val if 10 <= val <= 200 else None
+        except ValueError:
+            return None
+
+    def _parse_bmc_area(tok: Optional[str]) -> Optional[float]:
+        """Parse a BMC or Area token."""
+        if not tok:
+            return None
+        tok = tok.strip("[]|\"'(),")
+        try:
+            return float(tok)
+        except ValueError:
+            return None
 
     def _clamp(v: Optional[float]) -> Optional[float]:
         return v if v is not None and SCORE_MIN <= v <= SCORE_MAX else None
 
-    return BmdResult(bmd=bmd, t=_clamp(t), z=_clamp(z))
+    # ── determine column layout ──────────────────────────────────────────
+    ya_tok = _tok(1)
+    merged_ya, merged_t = _split_merged_ya_t(ya_tok) if ya_tok else (None, None)
+
+    if merged_ya is not None:
+        # Merged YA+T format: BMD  YA+T  AM%  Z  BMC  Area …
+        ya_pct = float(merged_ya)
+        t      = merged_t
+        am_pct = _parse_pct(_tok(2))
+        z      = parse_score_token(_tok(3)) if _tok(3) else None
+        bmc    = _parse_bmc_area(_tok(4))
+        area   = _parse_bmc_area(_tok(5))
+    else:
+        # Standard format: BMD  YA%  T  AM%  Z  BMC  Area …
+        ya_pct = _parse_pct(ya_tok)
+        t      = parse_score_token(_tok(2), expect_negative=True) if _tok(2) else None
+        am_pct = _parse_pct(_tok(3))
+        z      = parse_score_token(_tok(4)) if _tok(4) else None
+        bmc    = _parse_bmc_area(_tok(5))
+        area   = _parse_bmc_area(_tok(6))
+
+    return BmdResult(
+        bmd=bmd,
+        ya_pct=ya_pct,
+        t=_clamp(t),
+        am_pct=am_pct,
+        z=_clamp(z),
+        bmc=bmc,
+        area=area,
+    )
 
 
 # ── GE Lunar section parser ───────────────────────────────────────────────────
@@ -395,30 +546,61 @@ def ge_spine_l1l4(texts: dict[str, str]) -> BmdResult:
 
 
 def ge_spine_vertebrae(texts: dict[str, str]) -> dict[str, Optional[float]]:
-    """Return per-vertebra (L1–L4) BMD, T, Z dicts when available."""
-    keys = [k for v in range(1, 5) for k in (f"Spine_L{v}_BMD", f"Spine_L{v}_T", f"Spine_L{v}_Z")]
+    """Return per-vertebra (L1–L4) BMD, T, Z, YA, AM, BMC, Area dicts."""
+    _VERT_FIELDS = ("BMD", "YA", "T", "AM", "Z", "BMC", "Area")
+    keys = [k for v in range(1, 5) for k in (f"Spine_L{v}_{f}" for f in _VERT_FIELDS)]
     out: dict[str, Optional[float]] = dict.fromkeys(keys, None)
+
+    # Match a line whose first token looks like a SINGLE vertebra label.
+    # Handles common OCR misreads: "u" / "Ll" / "LI" → L1, etc.
+    # The (?!\s*[-–]) negative lookahead prevents matching combined ranges
+    # like "L1-L2", "L1-L4" which start with the same prefix.
+    _RE_SINGLE_VERT = re.compile(
+        r"^[\s]*(?:L([1-4])(?!\s*[-–])|[uU](?=\s)|[Ll][lI1](?=\s)|[Ll][|I1](?=\s))",
+        re.IGNORECASE,
+    )
+    # Map OCR misread tokens to the correct vertebra number
+    _VERTEX_OCR_FIX: dict[str, int] = {
+        "u": 1, "U": 1,
+        "ll": 1, "Ll": 1, "LI": 1, "lI": 1,
+        "L|": 1, "l|": 1, "L1": 1, "l1": 1,
+    }
 
     for txt in texts.values():
         rows = _find_section_rows(txt, "ap spine")
         if not rows:
             continue
         for line in rows:
-            first = line.strip().split()[0].lower().strip(".:)") if line.strip().split() else ""
-            if len(first) == 2 and first[0] == "l" and first[1].isdigit():
-                v = int(first[1])
+            m = _RE_SINGLE_VERT.match(line)
+            if not m:
+                # Check for known OCR misreads
+                first_token = line.strip().split()[0] if line.strip().split() else ""
+                v = _VERTEX_OCR_FIX.get(first_token, 0)
+                if v == 0:
+                    continue
             else:
-                m = re.match(r"\s*(L?)([1-5])\b", line.strip(), re.IGNORECASE)
-                v = int(m.group(2)) if m else 0
+                if m.group(1):
+                    v = int(m.group(1))
+                else:
+                    # Matched an OCR misread variant → L1
+                    v = 1
             if not 1 <= v <= 4:
                 continue
             result = extract_bmd_row(line)
             if result.bmd is not None and BMD_MIN < result.bmd < BMD_MAX:
                 out[f"Spine_L{v}_BMD"] = result.bmd
+            if result.ya_pct is not None:
+                out[f"Spine_L{v}_YA"] = result.ya_pct
             if result.t is not None:
                 out[f"Spine_L{v}_T"] = result.t
+            if result.am_pct is not None:
+                out[f"Spine_L{v}_AM"] = result.am_pct
             if result.z is not None:
                 out[f"Spine_L{v}_Z"] = result.z
+            if result.bmc is not None:
+                out[f"Spine_L{v}_BMC"] = result.bmc
+            if result.area is not None:
+                out[f"Spine_L{v}_Area"] = result.area
 
         if any(out[f"Spine_L{i}_BMD"] is not None for i in range(1, 5)):
             return out
@@ -426,7 +608,10 @@ def ge_spine_vertebrae(texts: dict[str, str]) -> dict[str, Optional[float]]:
     # Fallback: regex scan of combined text
     comb = combined(texts)
     for i in range(1, 5):
-        m = re.search(rf"\bL{i}\b[^\n]*?(0\.[4-9]\d{{2}}|1\.\d{{3}})", comb, re.IGNORECASE)
+        # Look for "L{i}" at start of line followed by a BMD-like number
+        m = re.search(rf"(?:^|\n)\s*L{i}\s+.*?(0\.[4-9]\d{{2}}|1\.\d{{3}})", comb, re.IGNORECASE | re.MULTILINE)
+        if not m:
+            m = re.search(rf"\bL{i}\b[^\n]*?(0\.[4-9]\d{{2}}|1\.\d{{3}})", comb, re.IGNORECASE)
         if m:
             try:
                 out[f"Spine_L{i}_BMD"] = float(m.group(1))
@@ -644,6 +829,17 @@ def parse_tbs(txt: str) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 
+def parse_ethnicity(txt: str) -> Optional[str]:
+    m = _RE_ETHNICITY.search(txt)
+    if not m:
+        return None
+    cand = _clean_str(m.group(1))
+    # Filter out false matches: "Gender / Ethnicity: Female" → "Female" is sex
+    if cand.lower() in ("female", "male", "f", "m", ""):
+        return None
+    return cand
+
+
 # ── section capture ───────────────────────────────────────────────────────────
 
 def _capture_section(txt: str, header_patterns: list[str], stop_patterns: list[str], max_lines: int = 120) -> tuple[str, list[str]]:
@@ -726,7 +922,32 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
     if not patient_dir.is_dir():
         return None
 
-    texts = read_folder(patient_dir)
+    # ── read manufacturer hint ────────────────────────────────────────────
+    mfr_path = patient_dir / "_manufacturer.txt"
+    # Fallback: check the canonical Tesseract output dir for metadata
+    if not mfr_path.exists():
+        tess_dir = _SCRIPT_DIR / "extracted_text" / f"Patient_{folder_num}"
+        mfr_path = tess_dir / "_manufacturer.txt"
+    manufacturer = ""
+    if mfr_path.exists():
+        manufacturer = mfr_path.read_text(encoding="utf-8").strip().upper()
+
+    # ── for GE: read the table-only allowlist ─────────────────────────────
+    table_only_bases: set[str] | None = None
+    if manufacturer == "GE":
+        list_path = patient_dir / "_table_only.txt"
+        if not list_path.exists():
+            tess_dir = _SCRIPT_DIR / "extracted_text" / f"Patient_{folder_num}"
+            list_path = tess_dir / "_table_only.txt"
+        if list_path.exists():
+            raw = list_path.read_text(encoding="utf-8").strip()
+            if raw:
+                table_only_bases = set(raw.splitlines())
+                print(f"  Patient {folder_num} (GE): filtering to {len(table_only_bases)} table-only images")
+        # If the list exists but is empty (no table-only images found),
+        # table_only_bases stays None → all images used (degraded mode).
+
+    texts = read_folder(patient_dir, table_only_bases=table_only_bases)
     if not texts:
         return None
 
@@ -738,6 +959,7 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
         "OCR_DOB":          parse_dob(comb),
         "OCR_Age_years":    parse_age(comb),
         "OCR_Sex":          parse_sex(comb),
+        "OCR_Ethnicity":    parse_ethnicity(comb),
         "OCR_Height_in":    parse_height(comb),
         "OCR_Weight_lbs":   parse_weight(comb),
         "OCR_Referring_MD": parse_physician(comb),
@@ -745,7 +967,7 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
         "OCR_TBS_L1L4":     parse_tbs(comb),
     }
 
-    is_hologic = "hologic" in comb.lower()
+    is_hologic = "hologic" in comb.lower() or manufacturer == "HOLOGIC"
     if is_hologic:
         # Try a Hologic-specific heuristic extractor; fall back to empty fields
         # if the heuristic finds nothing usable.
@@ -782,14 +1004,24 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
 _PREFERRED_COLUMNS = [
     "Folder", "PatientID", "PatientName", "Sex", "DOB", "AccessionNumber",
     "StudyDate", "StudyTime", "Manufacturer", "Model",
-    "OCR_Name", "OCR_DOB", "OCR_Age_years", "OCR_Sex", "OCR_Height_in",
-    "OCR_Weight_lbs", "OCR_Referring_MD", "OCR_Scan_Date", "OCR_TBS_L1L4",
-    "Spine_L1L4_BMD", "Spine_L1L4_T", "Spine_L1L4_Z",
-    *(f"Spine_L{i}_{m}" for i in range(1, 5) for m in ("BMD", "T", "Z")),
-    "LFemur_Neck_BMD", "LFemur_Neck_T", "LFemur_Neck_Z",
-    "LFemur_Total_BMD", "LFemur_Total_T", "LFemur_Total_Z",
-    "RFemur_Neck_BMD", "RFemur_Neck_T", "RFemur_Neck_Z",
-    "RFemur_Total_BMD", "RFemur_Total_T", "RFemur_Total_Z",
+    "OCR_Name", "OCR_DOB", "OCR_Age_years", "OCR_Sex", "OCR_Ethnicity",
+    "OCR_Height_in", "OCR_Weight_lbs", "OCR_Referring_MD", "OCR_Scan_Date", "OCR_TBS_L1L4",
+    # ── Spine L1‑L4 combined ──
+    "Spine_L1L4_BMD", "Spine_L1L4_YA", "Spine_L1L4_T", "Spine_L1L4_AM", "Spine_L1L4_Z",
+    "Spine_L1L4_BMC", "Spine_L1L4_Area",
+    # ── Per‑vertebra (L1–L4) ──
+    *(f"Spine_L{i}_{m}" for i in range(1, 5) for m in ("BMD", "YA", "T", "AM", "Z", "BMC", "Area")),
+    # ── Left Femur ──
+    "LFemur_Neck_BMD", "LFemur_Neck_YA", "LFemur_Neck_T", "LFemur_Neck_AM", "LFemur_Neck_Z",
+    "LFemur_Neck_BMC", "LFemur_Neck_Area",
+    "LFemur_Total_BMD", "LFemur_Total_YA", "LFemur_Total_T", "LFemur_Total_AM", "LFemur_Total_Z",
+    "LFemur_Total_BMC", "LFemur_Total_Area",
+    # ── Right Femur ──
+    "RFemur_Neck_BMD", "RFemur_Neck_YA", "RFemur_Neck_T", "RFemur_Neck_AM", "RFemur_Neck_Z",
+    "RFemur_Neck_BMC", "RFemur_Neck_Area",
+    "RFemur_Total_BMD", "RFemur_Total_YA", "RFemur_Total_T", "RFemur_Total_AM", "RFemur_Total_Z",
+    "RFemur_Total_BMC", "RFemur_Total_Area",
+    # ── Raw section captures ──
     *(f"{s}_{t}" for s in ("AP_Spine", "Left_Femur", "Right_Femur", "DualFemur", "TBS", "Trend")
       for t in ("RowCount", "Text", "Rows")),
 ]

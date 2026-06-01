@@ -68,6 +68,34 @@ def available_patients(text_dir: Path) -> list[str]:
     return sorted(nums, key=lambda v: int(v) if v.isdigit() else 999)
 
 
+def _copy_metadata_for_paddle(args: argparse.Namespace) -> None:
+    """Copy GE/Hologic metadata files from Tesseract output to Paddle text dir.
+
+    This ensures the parser can apply table-only filtering for GE scans even
+    when using the Paddle backend (which has its own text directory).  The
+    metadata is originally created by the Tesseract step.
+    """
+    tesseract_dir = _PROJECT_DIR / "extracted_text"
+    paddle_dir = _PROJECT_DIR / "paddle_text"
+    if not tesseract_dir.is_dir() or not paddle_dir.is_dir():
+        return
+    copied = 0
+    for patient_dir in tesseract_dir.iterdir():
+        if not patient_dir.is_dir() or not patient_dir.name.startswith("Patient_"):
+            continue
+        dest_dir = paddle_dir / patient_dir.name
+        if not dest_dir.is_dir():
+            continue
+        for meta_file in ("_manufacturer.txt", "_table_only.txt"):
+            src = patient_dir / meta_file
+            if src.exists():
+                import shutil
+                shutil.copy2(src, dest_dir / meta_file)
+                copied += 1
+    if copied and not args.dry_run:
+        print(f"  Copied {copied} GE/Hologic metadata files to paddle_text/")
+
+
 # ── stages ────────────────────────────────────────────────────────────────────
 
 def step_tesseract(args: argparse.Namespace) -> int:
@@ -120,6 +148,10 @@ def step_paddle(args: argparse.Namespace) -> int:
     if rc != 0:
         print("  Paddle reorganize failed — stopping.")
         return rc
+
+    # Copy GE/Hologic metadata from Tesseract output to Paddle text dir
+    # so the parser can apply table-only filtering for GE scans.
+    _copy_metadata_for_paddle(args)
 
     print("\n\033[1m=== PADDLE → WIDE CSV (FULL PARSE) ===\033[0m")
     rc = run([
@@ -205,12 +237,29 @@ def step_validate(args: argparse.Namespace) -> int:
         paddle["Folder"] = paddle["Folder"].astype(str)
 
     # Columns to compare: (label, tess_col, paddle_col, tolerance)
-    COMPARE_COLS = [
-        ("Spine BMD (g/cm²)",  "Spine_L1L4_BMD",   0.05),
-        ("Spine T-score",     "Spine_L1L4_T",      0.5),
-        ("Fem Neck BMD",      "LFemur_Neck_BMD",   0.05),
-        ("Fem Neck T-score",  "LFemur_Neck_T",     0.5),
-        ("Fem Total BMD",     "LFemur_Total_BMD",  0.05),
+    COMPARE_COLS: list[tuple[str, str, float]] = [
+        # ── Spine L1‑L4 ──
+        ("Spine BMD",          "Spine_L1L4_BMD",   0.05),
+        ("Spine YA%",          "Spine_L1L4_YA",    5.0),
+        ("Spine T",            "Spine_L1L4_T",     0.5),
+        ("Spine AM%",          "Spine_L1L4_AM",    5.0),
+        ("Spine Z",            "Spine_L1L4_Z",     0.5),
+        ("Spine BMC",          "Spine_L1L4_BMC",   2.0),
+        ("Spine Area",         "Spine_L1L4_Area",  2.0),
+        # ── Left Femur Neck ──
+        ("LFem Neck BMD",      "LFemur_Neck_BMD",  0.05),
+        ("LFem Neck T",        "LFemur_Neck_T",    0.5),
+        ("LFem Neck Z",        "LFemur_Neck_Z",    0.5),
+        # ── Left Femur Total ──
+        ("LFem Total BMD",     "LFemur_Total_BMD", 0.05),
+        ("LFem Total T",       "LFemur_Total_T",   0.5),
+        ("LFem Total Z",       "LFemur_Total_Z",   0.5),
+        # ── Right Femur Neck ──
+        ("RFem Neck BMD",      "RFemur_Neck_BMD",  0.05),
+        ("RFem Neck T",        "RFemur_Neck_T",    0.5),
+        # ── Right Femur Total ──
+        ("RFem Total BMD",     "RFemur_Total_BMD", 0.05),
+        ("RFem Total T",       "RFemur_Total_T",   0.5),
     ]
 
     lines: list[str] = []
@@ -220,26 +269,36 @@ def step_validate(args: argparse.Namespace) -> int:
     lines.append("")
     lines.append("## Backend Comparison")
     lines.append("")
-    lines.append("| # | Patient | Spine BMD (T/P) | Spine T (T/P) | Fem Neck BMD (T/P) | Fem Total BMD (T/P) | Status |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| # | Patient | Age | Spine BMD (T/P) | Spine T (T/P) | Spine Z (T/P) | LFem Total BMD (T/P) | LFem Total T (T/P) | Status |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
 
-    flags_surya: list[str] = []   # patients where Paddle missed and Surya could help
+    flags_surya: list[str] = []
+    flags_sign: list[str] = []     # patients with likely sign errors in T‑scores
     ok_count = 0
     flagged_count = 0
 
     for _, trow in tess.iterrows():
         folder = str(trow["Folder"])
-        name = str(trow.get("OCR_Name", ""))[:22]
+        name = str(trow.get("OCR_Name", ""))[:20]
+        age  = trow.get("OCR_Age_years")
 
-        # Look up Paddle row
         prow = None
         if has_paddle:
             pm = paddle[paddle["Folder"] == folder]
             if not pm.empty:
                 prow = pm.iloc[0]
 
-        # Build comparison string per column
-        parts: list[str] = []
+        # ── Build display values ─────────────────────────────────────────
+        def _disp(val) -> str:
+            return f"{val:.3f}" if not pd.isna(val) else "—"
+
+        spine_bmd = f"{_disp(trow.get('Spine_L1L4_BMD'))} / {_disp(prow.get('Spine_L1L4_BMD')) if prow is not None else '—'}"
+        spine_t   = f"{_disp(trow.get('Spine_L1L4_T'))} / {_disp(prow.get('Spine_L1L4_T')) if prow is not None else '—'}"
+        spine_z   = f"{_disp(trow.get('Spine_L1L4_Z'))} / {_disp(prow.get('Spine_L1L4_Z')) if prow is not None else '—'}"
+        lfem_bmd  = f"{_disp(trow.get('LFemur_Total_BMD'))} / {_disp(prow.get('LFemur_Total_BMD')) if prow is not None else '—'}"
+        lfem_t    = f"{_disp(trow.get('LFemur_Total_T'))} / {_disp(prow.get('LFemur_Total_T')) if prow is not None else '—'}"
+
+        # ── Compare all columns ───────────────────────────────────────────
         all_ok = True
         any_tess_has = False
         any_paddle_has = False
@@ -255,19 +314,26 @@ def step_validate(args: argparse.Namespace) -> int:
                 any_tess_has = True
             if pv_ok:
                 any_paddle_has = True
-
-            t_disp = f"{tv:.3f}" if tv_ok else "—"
-            p_disp = f"{pv:.3f}" if pv_ok else "—"
-            parts.append(f"{t_disp} / {p_disp}")
-
             if tv_ok and pv_ok:
                 diff = abs(float(tv) - float(pv))
                 if diff > tol:
                     all_ok = False
                     any_differs = True
-                    detail.append(f"{label}: {t_disp} vs {p_disp} (Δ={diff:.3f})")
+                    detail.append(f"{label}: {_disp(tv)} vs {_disp(pv)} (Δ={diff:.3f})")
 
-        # Determine status
+        # ── Sign heuristics: flag positive T‑scores for patients ≥ 50 ─────
+        age_val = float(age) if not pd.isna(age) else 0
+        if age_val >= 50:
+            for scol in ("Spine_L1L4_T", "LFemur_Neck_T", "LFemur_Total_T",
+                         "RFemur_Neck_T", "RFemur_Total_T"):
+                tv = trow.get(scol)
+                pv = prow.get(scol) if prow is not None else None
+                if not pd.isna(tv) and float(tv) > 0:
+                    flags_sign.append(f"Patient {folder}: Tesseract {scol}={_disp(tv)} (positive — likely sign error)")
+                if pv is not None and not pd.isna(pv) and float(pv) > 0:
+                    flags_sign.append(f"Patient {folder}: Paddle {scol}={_disp(pv)} (positive — likely sign error)")
+
+        # ── Status ────────────────────────────────────────────────────────
         if not any_tess_has and not any_paddle_has:
             status = "⚠️ BOTH MISSING"
             flagged_count += 1
@@ -280,7 +346,7 @@ def step_validate(args: argparse.Namespace) -> int:
             status = "🟡 TESS MISSING"
             flagged_count += 1
         elif any_differs:
-            status = f"🔴 MISMATCH ({'; '.join(detail)})"
+            status = f"🔴 MISMATCH ({'; '.join(detail[:3])})"  # limit detail to 3 items
             flagged_count += 1
             if not any_paddle_has and has_paddle:
                 flags_surya.append(folder)
@@ -288,10 +354,18 @@ def step_validate(args: argparse.Namespace) -> int:
             status = "🟢 OK"
             ok_count += 1
 
-        lines.append(f"| {folder} | {name} | {' | '.join(parts)} | {status} |")
+        lines.append(f"| {folder} | {name} | {_disp(age)} | {spine_bmd} | {spine_t} | {spine_z} | {lfem_bmd} | {lfem_t} | {status} |")
 
     lines.append("")
     lines.append(f"**Summary:** {ok_count} OK, {flagged_count} flagged")
+    if flags_sign:
+        lines.append("")
+        lines.append("## ⚠️ Possible Sign Errors")
+        lines.append("")
+        lines.append("The following T‑scores are positive for patients ≥ 50 years old — likely OCR sign‑loss errors:")
+        lines.append("")
+        for s in sorted(set(flags_sign)):
+            lines.append(f"- {s}")
     if flags_surya:
         lines.append("")
         lines.append(f"**Patients where Paddle is missing (Surya fallback recommended):** {', '.join(flags_surya)}")

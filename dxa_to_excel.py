@@ -137,19 +137,27 @@ def _digit_count(s: str) -> int:
 
 # ── OCR score parser ──────────────────────────────────────────────────────────
 
-def parse_score_token(tok: str) -> Optional[float]:
+def parse_score_token(tok: str, expect_negative: bool = False) -> Optional[float]:
     tok = tok.strip("[]|\"'()")
     if not tok or tok in ("N/A", "-", "=", "*", ">", "<"):
         return None
     if tok in _OCR_SIGN_MAP:
         return _OCR_SIGN_MAP[tok]
+    # Handle explicit negative sign
+    has_explicit_minus = tok.startswith("-")
     cleaned = re.sub(r"[^0-9.\-]", "", tok)
     if not cleaned or cleaned == ".":
         return None
     try:
         val = float(cleaned)
         if tok.isdigit() and 2 <= len(tok) <= 3:
-            val = -abs(val / 10.0)
+            if expect_negative:
+                val = -abs(val / 10.0)
+            else:
+                val = val / 10.0
+        if expect_negative and not has_explicit_minus and not tok.startswith("-"):
+            if tok not in _OCR_SIGN_MAP:
+                val = -abs(val)
         return val
     except ValueError:
         return None
@@ -195,7 +203,7 @@ def extract_bmd_row(row_str: str) -> BmdResult:
             t = merged_t
             z = parse_score_token(_tok(3)) if _tok(3) else None
         else:
-            t = parse_score_token(_tok(2)) if _tok(2) else None
+            t = parse_score_token(_tok(2), expect_negative=True) if _tok(2) else None
             z = parse_score_token(_tok(4)) if _tok(4) else None
 
     def _clamp(v: Optional[float]) -> Optional[float]:

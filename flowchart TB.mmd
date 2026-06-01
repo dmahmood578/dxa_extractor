@@ -1,0 +1,37 @@
+flowchart TB
+    subgraph INPUT["📁 Input"]
+        DICOM["CLD DXA/{1..N}/*.dcm<br/>Raw DICOM files"]
+    end
+
+    subgraph TESS["🔤 Tesseract OCR (step 1)"]
+        EXTRACT["extract_all_data.py<br/>• Extract PNG images → extracted_images/<br/>• Run Tesseract OCR → extracted_text/<br/>• Detect manufacturer (GE / HOLOGIC)<br/>• Classify GE images: table-only vs figure<br/>• Save _table_only.txt + _manufacturer.txt"]
+    end
+
+    subgraph PARSE_T["📊 Tesseract → CSV"]
+        CSV_T["dxa_to_wide_csv.py<br/>• Read extracted_text/Patient_N/<br/>• GE: filter to table-only images only<br/>• HOLOGIC: use all images<br/>• Extract BMD/T/Z + demographics<br/>→ data/patient_wide_measurements.csv"]
+    end
+
+    subgraph PADDLE["🔍 Paddle OCR (step 2)"]
+        PAD_OCR["run_paddle_batch.py<br/>or run_paddle_parallel.py<br/>• Read extracted_images/<br/>• Run PaddleOCR<br/>→ ocr_compare/patient_N/paddle/"]
+        PAD_REORG["paddle_to_parser_layout.py<br/>• Reorganize output<br/>→ paddle_text/Patient_N/"]
+        PAD_META["Copy metadata<br/>extracted_text/ → paddle_text/<br/>(_table_only.txt, _manufacturer.txt)"]
+    end
+
+    subgraph PARSE_P["📊 Paddle → CSV"]
+        CSV_P["dxa_to_wide_csv.py<br/>--text-source paddle_text<br/>• Same GE/Hologic filtering<br/>→ data/paddle_wide_measurements.csv"]
+    end
+
+    subgraph VALIDATE["✅ Validation (step 3)"]
+        COMPARE["Per-patient comparison<br/>Tesseract vs Paddle<br/>→ ocr_compare/patient_N/"]
+        REPORT["Agreement report<br/>→ data/validation_report.md<br/>Flags gaps, Surya recommendations"]
+    end
+
+    DICOM --> EXTRACT
+    EXTRACT --> CSV_T
+    EXTRACT --> PAD_OCR
+    CSV_T --> COMPARE
+    PAD_OCR --> PAD_REORG
+    PAD_REORG --> PAD_META
+    PAD_META --> CSV_P
+    CSV_P --> COMPARE
+    COMPARE --> REPORT
