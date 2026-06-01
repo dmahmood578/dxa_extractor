@@ -1,6 +1,8 @@
 import os
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,6 +12,77 @@ from PIL import Image, ImageFilter, ImageOps
 
 TESSERACT_PATH = "tesseract"
 TESSERACT_NUMERIC_WHITELIST = "0123456789.,-+()%[]/:|"
+
+# Common Windows install paths for Tesseract (checked as fallback)
+_TESSERACT_WIN_CANDIDATES = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe"),
+    os.path.expandvars(r"%APPDATA%\Tesseract-OCR\tesseract.exe"),
+]
+
+
+def _resolve_tesseract_path() -> str:
+    """Return the best available tesseract executable path.
+
+    On macOS/Linux this is usually just 'tesseract' (in PATH).
+    On Windows we first check PATH, then fall back to common install directories.
+    """
+    # 1. Check if 'tesseract' (or 'tesseract.exe') is on PATH
+    if shutil.which(TESSERACT_PATH):
+        return TESSERACT_PATH
+    if shutil.which("tesseract.exe"):
+        return "tesseract.exe"
+
+    # 2. Windows: search well-known install locations
+    for candidate in _TESSERACT_WIN_CANDIDATES:
+        if os.path.isfile(candidate):
+            return candidate
+
+    return TESSERACT_PATH  # fall back to bare name (will fail with clear msg)
+
+
+def _check_tesseract_available() -> bool:
+    """Verify tesseract is callable.  Prints a helpful message on failure."""
+    tesseract_exe = _resolve_tesseract_path()
+    try:
+        cp = subprocess.run(
+            [tesseract_exe, "--version"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+        if cp.returncode == 0:
+            # Print first line of version output so the user can confirm
+            version_line = (cp.stdout or "").strip().split("\n")[0]
+            print(f"Tesseract found: {version_line}")
+            return True
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    print("\n" + "=" * 68)
+    print("  ERROR: Tesseract OCR is not installed or not on your PATH.")
+    print("  Tesseract is a SYSTEM dependency — it is NOT a Python package.")
+    print()
+    print("  To install:")
+    print("    macOS:   brew install tesseract")
+    print("    Linux:   sudo apt install tesseract-ocr")
+    print("    Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki")
+    print("             During install, check 'Add Tesseract to system PATH'")
+    print("             or add  C:\\Program Files\\Tesseract-OCR  to your PATH manually.")
+    print()
+    print("  After installing, re-open your terminal and try again.")
+    print("=" * 68 + "\n")
+    return False
+
+
+def _get_tesseract_exe() -> str:
+    """Return the resolved tesseract executable (cached after first call)."""
+    if not hasattr(_get_tesseract_exe, "_cached"):
+        _get_tesseract_exe._cached = _resolve_tesseract_path()  # type: ignore[attr-defined]
+    return _get_tesseract_exe._cached  # type: ignore[attr-defined]
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_SCRIPT_DIR)
@@ -129,9 +202,16 @@ def _tesseract_text_from_image(img, psm=6, numeric=False):
 
     try:
         _prepare_ocr_image(img, numeric=numeric).save(tmp_path)
-        cmd = [TESSERACT_PATH, tmp_path, "stdout", *config]
+        tesseract_exe = _get_tesseract_exe()
+        cmd = [tesseract_exe, tmp_path, "stdout", *config]
         cp = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
         return (cp.stdout or "").strip()
+    except FileNotFoundError:
+        raise RuntimeError(
+            "Tesseract OCR is not installed or not on your PATH. "
+            "Install from https://github.com/UB-Mannheim/tesseract/wiki (Windows) "
+            "or 'brew install tesseract' (macOS)."
+        ) from None
     finally:
         try:
             os.unlink(tmp_path)
@@ -411,6 +491,11 @@ def process_patient_folder(folder):
 
 
 def main():
+    # Verify tesseract is available before doing any work
+    if not _check_tesseract_available():
+        print("Cannot continue without Tesseract OCR.  Please install it and re-run.")
+        sys.exit(1)
+
     folders = sorted(
         [folder for folder in os.listdir(CLD_DXA_DIR) if os.path.isdir(os.path.join(CLD_DXA_DIR, folder))],
         key=lambda value: int(value) if value.isdigit() else 999,

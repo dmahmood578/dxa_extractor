@@ -967,6 +967,9 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
         "OCR_TBS_L1L4":     parse_tbs(comb),
     }
 
+    if demographics_row is not None and "PatientID" in demographics_row:
+        rec["PatientID"] = demographics_row["PatientID"]
+
     is_hologic = "hologic" in comb.lower() or manufacturer == "HOLOGIC"
     if is_hologic:
         # Try a Hologic-specific heuristic extractor; fall back to empty fields

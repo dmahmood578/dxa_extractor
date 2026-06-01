@@ -32,9 +32,25 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _SCRIPT_DIR.parent
 
-# Use the same Python interpreter that is running this script.
-# When the venv is activated, sys.executable already points to the venv Python.
-_VENV_PYTHON = sys.executable
+def _resolve_project_python() -> str:
+    """Prefer the repository .venv Python so subprocesses use the project env.
+
+    This avoids accidentally inheriting an Anaconda/system interpreter when the
+    shell activation did not switch the current terminal the way the user expected.
+    """
+    if os.name == "nt":
+        candidate = _PROJECT_DIR / ".venv" / "Scripts" / "python.exe"
+    else:
+        candidate = _PROJECT_DIR / ".venv" / "bin" / "python"
+
+    if candidate.exists():
+        return str(candidate)
+
+    # Fall back to the interpreter that launched this script.
+    return sys.executable
+
+
+_VENV_PYTHON = _resolve_project_python()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 

@@ -1,7 +1,9 @@
 pydicom
 Pillow
-numpy
+numpy<2.0
 pandas
 openpyxl
 pytesseract
 lxml
+paddlepaddle==2.6.2
+paddleocr==2.7.3

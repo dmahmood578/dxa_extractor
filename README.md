@@ -182,6 +182,7 @@ The project supports PaddleOCR and Surya as alternative OCR backends. The unifie
 source .venv/bin/activate          # macOS / Linux
 # .venv\Scripts\activate           # Windows
 
+pip install --upgrade numpy<2.0                      # NumPy 2.0+ incompatible with PaddleOCR's imgaug dependency
 pip install paddlepaddle==2.6.2 paddleocr==2.7.3   # PaddleOCR (pin both — 3.x PaddleOCR requires Paddle 3.x which has Windows bugs)
 pip install surya-ocr opencv-python         # Surya (macOS/Linux only)
 brew install llama.cpp                      # Surya dependency (macOS)
@@ -222,6 +223,8 @@ The extractor detects the DXA scanner manufacturer from DICOM tags (or OCR text 
 | Paddle `ConvertPirAttribute…` / `onednn_instruction.cc` (Windows) | PaddlePaddle 3.x oneDNN bug on Windows. Use `paddlepaddle==2.6.2 paddleocr==2.7.3` |
 | Paddle `set_optimization_level` error | PaddleOCR 3.x + PaddlePaddle 2.x mismatch. Use `paddlepaddle==2.6.2 paddleocr==2.7.3` |
 | `FileNotFoundError` from `run_full_pipeline.py` (Windows) | Ensure the venv is activated before running the pipeline. The runner uses `sys.executable` — it needs the venv Python. |
+| `AttributeError: module 'numpy' has no attribute 'sctypes'` (Paddle import fails) | NumPy 2.0+ removed `sctypes`, but old `imgaug` (PaddleOCR dependency) still uses it. Pin NumPy: `pip install "numpy<2.0"` |
+| `SSLError: CERTIFICATE_VERIFY_FAILED` (Paddle model download fails) | PaddleOCR downloads models from Baidu's servers — SSL verification can fail on Windows due to corporate proxies or antivirus. **Quick fix:** Check system clock (must be correct); if still failing, try: `pip install certifi` and `pip install --upgrade certifi`. If on corporate network, ask IT to allow `paddleocr.bj.bcebos.com` or pre-download models using a machine with unrestricted internet. |
 | T‑scores show positive values (should be negative) | Re‑run with latest code. The parser now corrects OCR sign loss for T‑scores and preserves Z‑score signs. |
 | `libpng error: IDAT: CRC error` | Re-run `extract_all_data.py` for that patient |
 | Merge finds no matching row | Use `--folder <n>` instead of `--name` |
