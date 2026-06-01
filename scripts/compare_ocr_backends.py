@@ -137,7 +137,7 @@ out_rows=[]
 for (region,source),r in agg.items():
     out_rows.append({'region':region,'source':source,'bmd':r.get('bmd',''),'t':r.get('t',''),'note':r.get('note','')})
 
-out_df = pd.DataFrame(out_rows)
+out_df = pd.DataFrame(out_rows, columns=['region', 'source', 'bmd', 't', 'note'])
 if args.out:
     out_df.to_csv(args.out,index=False)
     print('Wrote', args.out)
