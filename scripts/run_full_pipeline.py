@@ -84,6 +84,34 @@ def available_patients(text_dir: Path) -> list[str]:
     return sorted(nums, key=lambda v: int(v) if v.isdigit() else 999)
 
 
+def _selected_patients(raw_value: str | None) -> list[str] | None:
+    """Normalize a comma-separated patient selector into a sorted unique list.
+
+    Supports comma-separated folder numbers and inclusive numeric ranges like
+    `1-5`, which expands to `1,2,3,4,5`.
+    """
+    if not raw_value:
+        return None
+    patients = []
+    for piece in raw_value.split(","):
+        value = piece.strip()
+        if not value:
+            continue
+        range_match = None
+        if "-" in value:
+            parts = [part.strip() for part in value.split("-", 1)]
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                start, end = sorted((int(parts[0]), int(parts[1])))
+                for number in range(start, end + 1):
+                    candidate = str(number)
+                    if candidate not in patients:
+                        patients.append(candidate)
+                continue
+        if value not in patients:
+            patients.append(value)
+    return patients or None
+
+
 def _copy_metadata_for_paddle(args: argparse.Namespace) -> None:
     """Copy GE/Hologic metadata files from Tesseract output to Paddle text dir.
 
@@ -117,13 +145,19 @@ def _copy_metadata_for_paddle(args: argparse.Namespace) -> None:
 def step_tesseract(args: argparse.Namespace) -> int:
     """Run Tesseract extraction + wide CSV parse."""
     print("\n\033[1m=== TESSERACT EXTRACTION ===\033[0m")
-    rc = run([_VENV_PYTHON, "extract_all_data.py"], dry=args.dry_run)
+    extract_cmd = [_VENV_PYTHON, "extract_all_data.py"]
+    if args.patient:
+        extract_cmd.extend(["--patient", str(args.patient)])
+    rc = run(extract_cmd, dry=args.dry_run)
     if rc != 0:
         print("  Tesseract extraction failed — stopping.")
         return rc
 
     print("\n\033[1m=== TESSERACT → WIDE CSV ===\033[0m")
-    rc = run([_VENV_PYTHON, "dxa_to_wide_csv.py"], dry=args.dry_run)
+    csv_cmd = [_VENV_PYTHON, "dxa_to_wide_csv.py"]
+    if args.patient:
+        csv_cmd.extend(["--patient", str(args.patient)])
+    rc = run(csv_cmd, dry=args.dry_run)
     return rc
 
 
@@ -180,7 +214,7 @@ def step_paddle(args: argparse.Namespace) -> int:
 
 def step_surya(args: argparse.Namespace) -> int:
     """Run Surya OCR on one or all patients."""
-    patients = [args.patient] if args.patient else available_patients(Path("extracted_images"))
+    patients = _selected_patients(args.patient) or available_patients(Path("extracted_images"))
     if not patients:
         print("  No patients found for Surya.")
         return 1
@@ -206,7 +240,7 @@ def step_surya(args: argparse.Namespace) -> int:
 
 def step_compare(args: argparse.Namespace) -> int:
     """Generate backend comparison CSVs and markdown reports for all patients."""
-    patients = [args.patient] if args.patient else available_patients(Path("ocr_compare"))
+    patients = _selected_patients(args.patient) or available_patients(Path("ocr_compare"))
     if not patients:
         print("  No OCR compare data found.")
         return 1
@@ -251,6 +285,12 @@ def step_validate(args: argparse.Namespace) -> int:
     tess["Folder"] = tess["Folder"].astype(str)
     if has_paddle:
         paddle["Folder"] = paddle["Folder"].astype(str)
+
+    selected_patients = _selected_patients(args.patient)
+    if selected_patients:
+        tess = tess[tess["Folder"].isin(selected_patients)]
+        if has_paddle:
+            paddle = paddle[paddle["Folder"].isin(selected_patients)]
 
     # Columns to compare: (label, tess_col, paddle_col, tolerance)
     COMPARE_COLS: list[tuple[str, str, float]] = [

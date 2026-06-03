@@ -491,6 +491,31 @@ def process_patient_folder(folder):
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Extract images and OCR text from DXA DICOM folders.")
+    parser.add_argument("--patient", default=None, help="Limit processing to one or more patient folder numbers, comma-separated; supports inclusive ranges like 1-5")
+    args = parser.parse_args()
+
+    selected_patients = None
+    if args.patient:
+        selected_patients = []
+        for piece in str(args.patient).split(","):
+            value = piece.strip()
+            if not value:
+                continue
+            if "-" in value:
+                parts = [part.strip() for part in value.split("-", 1)]
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    start, end = sorted((int(parts[0]), int(parts[1])))
+                    for number in range(start, end + 1):
+                        candidate = str(number)
+                        if candidate not in selected_patients:
+                            selected_patients.append(candidate)
+                    continue
+            if value not in selected_patients:
+                selected_patients.append(value)
+
     # Verify tesseract is available before doing any work
     if not _check_tesseract_available():
         print("Cannot continue without Tesseract OCR.  Please install it and re-run.")
@@ -500,6 +525,12 @@ def main():
         [folder for folder in os.listdir(CLD_DXA_DIR) if os.path.isdir(os.path.join(CLD_DXA_DIR, folder))],
         key=lambda value: int(value) if value.isdigit() else 999,
     )
+
+    if selected_patients:
+        folders = [folder for folder in folders if folder in selected_patients]
+        if not folders:
+            print(f"No patient folder found for --patient {args.patient}")
+            sys.exit(1)
 
     print(f"Found {len(folders)} patient folders to process: {folders}")
 

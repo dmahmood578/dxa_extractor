@@ -68,7 +68,7 @@ _RE_AGE_LABEL   = re.compile(r"\bage\s*:\s*([0-9.]+)", re.IGNORECASE)
 _RE_AGE_YEARS   = re.compile(r"(\d{2}\.?\d)\s*years", re.IGNORECASE)
 _RE_DOB         = re.compile(r"(?:birth\s*date|dob)\s*[:\s]+([0-9/A-Za-z]+)", re.IGNORECASE)
 _RE_DOB_DIGITS  = re.compile(r"(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})")
-_RE_NAME        = re.compile(r"(?:patient|name)\s*:\s*['\"''""\s]*([A-Za-z][A-Za-z\s,.'\-]{3,60})", re.IGNORECASE)
+_RE_NAME        = re.compile(r"(?:patient|name)\s*[:\-]\s*['\"\s]*([A-Za-z][A-Za-z\s,.'-]{3,60})", re.IGNORECASE)
 _RE_SEX_LABEL   = re.compile(r"(?:sex|sexe)\s*[:/]\s*(female|male|f|m)", re.IGNORECASE)
 _RE_SEX_WORD    = re.compile(r"\b(Female|Male)\b", re.IGNORECASE)
 _RE_HEIGHT_IN   = re.compile(r"(?:height|heigl)\s*[/:\s]+([0-9a-zA-Z.]{3,7})\s*in", re.IGNORECASE)
@@ -394,15 +394,18 @@ def extract_bmd_row(row_str: str) -> BmdResult:
         ya_pct = float(merged_ya)
         t      = merged_t
         am_pct = _parse_pct(_tok(2))
-        z      = parse_score_token(_tok(3)) if _tok(3) else None
+        z_tok  = _tok(3)
+        z      = parse_score_token(z_tok) if z_tok else None
         bmc    = _parse_bmc_area(_tok(4))
         area   = _parse_bmc_area(_tok(5))
     else:
         # Standard format: BMD  YA%  T  AM%  Z  BMC  Area …
         ya_pct = _parse_pct(ya_tok)
-        t      = parse_score_token(_tok(2), expect_negative=True) if _tok(2) else None
+        t_tok  = _tok(2)
+        t      = parse_score_token(t_tok, expect_negative=True) if t_tok else None
         am_pct = _parse_pct(_tok(3))
-        z      = parse_score_token(_tok(4)) if _tok(4) else None
+        z_tok  = _tok(4)
+        z      = parse_score_token(z_tok) if z_tok else None
         bmc    = _parse_bmc_area(_tok(5))
         area   = _parse_bmc_area(_tok(6))
 
@@ -770,6 +773,33 @@ def parse_name(txt: str) -> Optional[str]:
     return None if (not cand or len(cand) < 4 or cand.upper() == cand) else cand
 
 
+def parse_patient_id(txt: str) -> Optional[str]:
+    """Extract the real OCR patient ID from the top demographic table."""
+    lines = txt.splitlines()
+
+    def _clean_candidate(fragment: str) -> Optional[str]:
+        fragment = re.sub(r"(?i).*patient\s*id\s*[:#]?\s*", "", fragment)
+        fragment = fragment.strip("[]|\"'(),:; ")
+        fragment = re.sub(r"[^A-Za-z0-9,._/-]", " ", fragment)
+        for token in fragment.split():
+            token = token.strip(",:;[]()")
+            token = re.sub(r"[^A-Za-z0-9_-]", "", token)
+            if len(token) >= 4:
+                return token
+        return None
+
+    for idx, line in enumerate(lines):
+        if re.search(r"\bpatient\s*id\b", line, re.IGNORECASE):
+            candidate = _clean_candidate(line)
+            if candidate:
+                return candidate
+            for extra_line in lines[idx + 1: idx + 4]:
+                candidate = _clean_candidate(extra_line)
+                if candidate:
+                    return candidate
+    return None
+
+
 def parse_sex(txt: str) -> Optional[str]:
     m = _RE_SEX_LABEL.search(txt) or _RE_SEX_WORD.search(txt)
     return m.group(1)[0].upper() if m else None
@@ -834,6 +864,8 @@ def parse_ethnicity(txt: str) -> Optional[str]:
     if not m:
         return None
     cand = _clean_str(m.group(1))
+    if not cand:
+        return None
     # Filter out false matches: "Gender / Ethnicity: Female" → "Female" is sex
     if cand.lower() in ("female", "male", "f", "m", ""):
         return None
@@ -955,10 +987,9 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
 
     rec: dict = {
         "Folder":           folder_num,
+        "PatientID":        parse_patient_id(comb),
         "OCR_Name":         parse_name(comb),
-        "OCR_DOB":          parse_dob(comb),
         "OCR_Age_years":    parse_age(comb),
-        "OCR_Sex":          parse_sex(comb),
         "OCR_Ethnicity":    parse_ethnicity(comb),
         "OCR_Height_in":    parse_height(comb),
         "OCR_Weight_lbs":   parse_weight(comb),
@@ -966,9 +997,6 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
         "OCR_Scan_Date":    parse_scan_date(comb),
         "OCR_TBS_L1L4":     parse_tbs(comb),
     }
-
-    if demographics_row is not None and "PatientID" in demographics_row:
-        rec["PatientID"] = demographics_row["PatientID"]
 
     is_hologic = "hologic" in comb.lower() or manufacturer == "HOLOGIC"
     if is_hologic:
@@ -1005,9 +1033,9 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
 # ── output column order ───────────────────────────────────────────────────────
 
 _PREFERRED_COLUMNS = [
-    "Folder", "PatientID", "PatientName", "Sex", "DOB", "AccessionNumber",
+    "Folder", "PatientID", "AccessionNumber",
     "StudyDate", "StudyTime", "Manufacturer", "Model",
-    "OCR_Name", "OCR_DOB", "OCR_Age_years", "OCR_Sex", "OCR_Ethnicity",
+    "OCR_Name", "OCR_Age_years", "OCR_Ethnicity",
     "OCR_Height_in", "OCR_Weight_lbs", "OCR_Referring_MD", "OCR_Scan_Date", "OCR_TBS_L1L4",
     # ── Spine L1‑L4 combined ──
     "Spine_L1L4_BMD", "Spine_L1L4_YA", "Spine_L1L4_T", "Spine_L1L4_AM", "Spine_L1L4_Z",
@@ -1035,9 +1063,31 @@ _PREFERRED_COLUMNS = [
 def main() -> None:
     import sys
 
+    def _expand_patient_selector(raw_value: Optional[str]) -> list[str] | None:
+        if not raw_value:
+            return None
+        patients: list[str] = []
+        for piece in str(raw_value).split(","):
+            value = piece.strip()
+            if not value:
+                continue
+            if "-" in value:
+                parts = [part.strip() for part in value.split("-", 1)]
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    start, end = sorted((int(parts[0]), int(parts[1])))
+                    for number in range(start, end + 1):
+                        candidate = str(number)
+                        if candidate not in patients:
+                            patients.append(candidate)
+                    continue
+            if value not in patients:
+                patients.append(value)
+        return patients or None
+
     # Parse optional CLI flags
     text_source = DEFAULT_TEXT_DIR
     output_csv = OUTPUT_CSV
+    patient_filter: Optional[str] = None
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == '--text-source' and i + 1 < len(sys.argv):
@@ -1046,11 +1096,16 @@ def main() -> None:
         elif sys.argv[i] == '--output' and i + 1 < len(sys.argv):
             output_csv = Path(sys.argv[i + 1])
             i += 2
+        elif sys.argv[i] == '--patient' and i + 1 < len(sys.argv):
+            patient_filter = sys.argv[i + 1]
+            i += 2
         else:
             i += 1
 
     global TEXT_DIR
     TEXT_DIR = Path(text_source)
+
+    selected_patients = _expand_patient_selector(patient_filter)
 
     demographics_df = (
         pd.read_csv(DEMOGRAPHICS_CSV) if DEMOGRAPHICS_CSV.exists() else pd.DataFrame()
@@ -1060,6 +1115,9 @@ def main() -> None:
         (d.name.removeprefix("Patient_") for d in TEXT_DIR.iterdir() if d.name.startswith("Patient_")),
         key=lambda v: int(v) if v.isdigit() else 999,
     )
+
+    if selected_patients is not None:
+        folders = [folder for folder in folders if folder in selected_patients]
 
     rows = []
     for folder_num in folders:
@@ -1076,6 +1134,9 @@ def main() -> None:
     df = pd.DataFrame(rows)
 
     if not demographics_df.empty and "Folder" in df.columns:
+        drop_cols = [c for c in ("PatientID", "PatientName", "Sex", "DOB") if c in demographics_df.columns]
+        if drop_cols:
+            demographics_df = demographics_df.drop(columns=drop_cols)
         demographics_df["Folder"] = demographics_df["Folder"].astype(str)
         df["Folder"] = df["Folder"].astype(str)
         df = demographics_df.merge(df, on="Folder", how="outer", suffixes=("", "_OCR"))
