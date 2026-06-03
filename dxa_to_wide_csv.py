@@ -988,6 +988,7 @@ def parse_patient(folder_num: str, demographics_row: Optional[pd.Series] = None)
     rec: dict = {
         "Folder":           folder_num,
         "PatientID":        parse_patient_id(comb),
+        "OCR_DOB":          parse_dob(comb),
         "OCR_Name":         parse_name(comb),
         "OCR_Age_years":    parse_age(comb),
         "OCR_Ethnicity":    parse_ethnicity(comb),
@@ -1036,7 +1037,7 @@ _PREFERRED_COLUMNS = [
     "Folder", "PatientID", "AccessionNumber",
     "StudyDate", "StudyTime", "Manufacturer", "Model",
     "OCR_Name", "OCR_Age_years", "OCR_Ethnicity",
-    "OCR_Height_in", "OCR_Weight_lbs", "OCR_Referring_MD", "OCR_Scan_Date", "OCR_TBS_L1L4",
+    "OCR_DOB", "OCR_Height_in", "OCR_Weight_lbs", "OCR_Referring_MD", "OCR_Scan_Date", "OCR_TBS_L1L4",
     # ── Spine L1‑L4 combined ──
     "Spine_L1L4_BMD", "Spine_L1L4_YA", "Spine_L1L4_T", "Spine_L1L4_AM", "Spine_L1L4_Z",
     "Spine_L1L4_BMC", "Spine_L1L4_Area",
